@@ -11,19 +11,18 @@
 #define OLED_ADDR 0x3C
 Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
 
-// ⚠ NeoPixel movido a pin 38: pin 48 lo ocupa el segmento E
+// ⚠ NeoPixel en pin 38 (pin 48 lo usa el segmento E del 7-seg)
 #define RGB_PIN 48
 Adafruit_NeoPixel rgb(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
-// Display 7 segmentos (ánodo común) – conexiones físicas correctas
-const int segPins[7] = {19, 21, 36, 35, 38, 20, 37}; 
+// Display 7 segmentos (ánodo común) – conexiones físicas
+const int segPins[7] = {19, 21, 36, 35, 38, 20, 37};  // a b c d e f g
 const int digPins[4] = {2, 42, 41, 40};
-// Periféricos
-const int LED1   = 15;   // indicador pausa
-const int LED2   = 16;   // indicador modo visualización
-const int BUZZER = 3;    // PWM via LEDC (50% duty = ~50% volumen)
 
-// Botones y switches (INPUT_PULLUP → LOW = activo)
+const int LED1   = 15;
+const int LED2   = 16;
+const int BUZZER = 3;
+
 const int BTN1=4, BTN2=5, BTN3=6, BTN4=7;
 const int SW1=13, SW2=14;
 
@@ -31,16 +30,8 @@ const int SW1=13, SW2=14;
 //  7 SEGMENTOS – ánodo común (bit=0 → segmento ON)
 // ═══════════════════════════════════════════════════════════════
 const uint8_t SEG[10] = {
-  0b1000000, // 0
-  0b1111001, // 1
-  0b0100100, // 2
-  0b0110000, // 3
-  0b0011001, // 4
-  0b0010010, // 5
-  0b0000010, // 6
-  0b1111000, // 7
-  0b0000000, // 8
-  0b0010000  // 9
+  0b1000000, 0b1111001, 0b0100100, 0b0110000, 0b0011001,
+  0b0010010, 0b0000010, 0b1111000, 0b0000000, 0b0010000
 };
 const uint8_t SEG_OFF = 0b1111111;
 
@@ -50,14 +41,12 @@ int           digActual  = 0;
 
 // ═══════════════════════════════════════════════════════════════
 //  MÁQUINA DE ESTADOS
-//  0=selección  1=cfg_tiempo  2=cfg_reps  3=resumen
-//  4=terapia    5=fin
 // ═══════════════════════════════════════════════════════════════
 int  estado    = 0;
 bool oledNuevo = true;
 
 // ═══════════════════════════════════════════════════════════════
-//  DEBOUNCE
+//  DEBOUNCE BOTONES
 // ═══════════════════════════════════════════════════════════════
 bool          antB1=1, antB2=1, antB3=1, antB4=1;
 unsigned long tB1=0,   tB2=0,   tB3=0,   tB4=0;
@@ -70,7 +59,7 @@ int           dcClics   = 0;
 unsigned long dcPrimero = 0;
 
 // ═══════════════════════════════════════════════════════════════
-//  CONFIGURACIÓN TERAPIA
+//  CONFIG TERAPIA
 // ═══════════════════════════════════════════════════════════════
 int cfgTiempo = 180;
 int cfgReps   = 5;
@@ -81,7 +70,7 @@ int cfgReps   = 5;
 int           totTiempo=0, totReps=0, repsHechas=0;
 unsigned long tInicio=0, acumPausa=0, tPausa=0;
 bool          enPausa  = false;
-int           razonFin = 0;   // 1=reps  2=tiempo  3=BTN3
+int           razonFin = 0;
 
 // ═══════════════════════════════════════════════════════════════
 //  AVISO 15 SEGUNDOS
@@ -91,46 +80,51 @@ unsigned long tAvisoInicio=0, tAvisoFlash=0;
 bool          avisoFlashOn = false;
 
 // ═══════════════════════════════════════════════════════════════
-//  BUZZER / RGB – timers
+//  BUZZER / RGB
 // ═══════════════════════════════════════════════════════════════
 unsigned long tBuzFin  = 0;
 unsigned long tRgbFin  = 0;
 uint32_t      colorRGB = 0;
 
-unsigned long tOled = 0;
+// ═══════════════════════════════════════════════════════════════
+//  SW1 – edge detection para pausa confiable
+// ═══════════════════════════════════════════════════════════════
+bool antSW1 = HIGH;
+
+// ═══════════════════════════════════════════════════════════════
+//  OLED – evitar redraws innecesarios (reducen parpadeo 7-seg)
+// ═══════════════════════════════════════════════════════════════
+int  lastSlOled   = -1;
+int  lastRepsOled = -1;
+bool lastPausOled = false;
 
 // ═══════════════════════════════════════════════════════════════
 //  AUXILIARES
 // ═══════════════════════════════════════════════════════════════
 
-// Apaga físicamente todos los dígitos del display
 void apagarDisplay() {
   for (int i=0; i<4; i++) digitalWrite(digPins[i], LOW);
 }
 
-// Enciende buzzer al 50% duty (≈50% amplitud) por 'ms' ms
 void encenderBuz(unsigned long ms) {
   tBuzFin = millis() + ms;
-  if (!avisoActivo) ledcWrite(BUZZER, 128);   // 128/255 = 50% duty
+  if (!avisoActivo) ledcWrite(BUZZER, 128);
 }
 
-// Enciende RGB inmediatamente y guarda cuándo apagarlo
 void encenderRGB(uint32_t color, unsigned long ms) {
-  colorRGB = color;
-  tRgbFin  = millis() + ms;
+  colorRGB = color; tRgbFin = millis() + ms;
   if (!avisoActivo) { rgb.setPixelColor(0, color); rgb.show(); }
 }
 
-// Solo apaga buzzer y RGB cuando vence su timer
 void actualizarBuzRGB(unsigned long ahora) {
   if (avisoActivo) return;
   if (ahora >= tBuzFin) ledcWrite(BUZZER, 0);
   if (ahora >= tRgbFin) { rgb.setPixelColor(0, 0); rgb.show(); }
 }
 
-// Multiplexado – solo llamar cuando el display debe estar activo
+// 1ms/dígito = 250Hz → parpadeo imperceptible
 void actualizarMux(unsigned long ahora) {
-  if (ahora - tMux < 2) return;
+  if (ahora - tMux < 1) return;
   tMux = ahora;
   digitalWrite(digPins[digActual], LOW);
   digActual = (digActual + 1) % 4;
@@ -139,7 +133,6 @@ void actualizarMux(unsigned long ahora) {
   digitalWrite(digPins[digActual], HIGH);
 }
 
-// 7-seg: [ blank | M | SS_dec | SS_uni ]
 void mostrarTiempo(int segs) {
   dispBuf[0] = SEG_OFF;
   dispBuf[1] = SEG[segs / 60];
@@ -172,6 +165,7 @@ void volverAlMenu() {
   rgb.setPixelColor(0, 0); rgb.show();
   digitalWrite(LED1, LOW); digitalWrite(LED2, LOW);
   apagarDisplay();
+  lastSlOled=-1; lastRepsOled=-1; lastPausOled=false;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -292,24 +286,23 @@ void pantallaFin() {
 //  SETUP
 // ═══════════════════════════════════════════════════════════════
 void setup() {
-  // Segmentos: todos apagados (ánodo común: HIGH = segmento OFF)
   for (int i=0; i<7; i++) { pinMode(segPins[i], OUTPUT); digitalWrite(segPins[i], HIGH); }
-  // Dígitos: todos apagados
-  for (int i=0; i<4; i++) { pinMode(digPins[i], OUTPUT); digitalWrite(digPins[i], LOW); }
-
-  pinMode(LED1,   OUTPUT); pinMode(LED2,   OUTPUT);
+  for (int i=0; i<4; i++) { pinMode(digPins[i], OUTPUT); digitalWrite(digPins[i], LOW);  }
+  pinMode(LED1, OUTPUT); pinMode(LED2, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(BTN1, INPUT_PULLUP); pinMode(BTN2, INPUT_PULLUP);
   pinMode(BTN3, INPUT_PULLUP); pinMode(BTN4, INPUT_PULLUP);
   pinMode(SW1,  INPUT_PULLUP); pinMode(SW2,  INPUT_PULLUP);
 
-  // LEDC: 1 kHz, resolución 8 bits → duty 128 = 50% volumen
-  ledcAttach(BUZZER, 1000, 8);
+  ledcAttach(BUZZER, 1000, 8);      // 1kHz, 8 bits, 50% duty = 128
 
   rgb.begin(); rgb.clear(); rgb.show();
-  Wire.begin(8, 9);   // SDA=8, SCL=9
+  Wire.begin(8, 9);
+  Wire.setClock(800000);            // 800kHz → oled.display() tarda ~7ms en vez de ~25ms
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   oled.clearDisplay(); oled.display();
+
+  antSW1 = digitalRead(SW1);        // estado inicial del switch
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -318,16 +311,15 @@ void setup() {
 void loop() {
   unsigned long ahora = millis();
 
-  // 7-seg: SOLO activo durante terapia (estado 4)
+  // 7-seg activo SOLO en estado 4
   if (estado == 4) actualizarMux(ahora);
 
   bool actB1=digitalRead(BTN1), actB2=digitalRead(BTN2);
   bool actB3=digitalRead(BTN3), actB4=digitalRead(BTN4);
 
-  // ── BTN4 global: volver al inicio (bloqueado en estado 0) ───
+  // ── BTN4 global ───────────────────────────────────────────
   if (estado != 0 && antB4==HIGH && actB4==LOW && (ahora-tB4 > DB)) {
-    volverAlMenu();   // incluye apagarDisplay()
-    tB4 = ahora;
+    volverAlMenu(); tB4=ahora;
   }
   antB4 = actB4;
 
@@ -336,21 +328,17 @@ void loop() {
   // ──────────────────────────────────────────────────────────
   if (estado == 0) {
     if (oledNuevo) { pantallaModos(); oledNuevo=false; }
-
     if (antB1==HIGH && actB1==LOW && (ahora-tB1 > DB)) {
-      estado=1; cfgTiempo=180; oledNuevo=true;
-      tB1=ahora;
+      estado=1; cfgTiempo=180; oledNuevo=true; tB1=ahora;
     }
-    // BTN2 → Estiramiento: pendiente laboratorio 16 abril
     antB1=actB1;
   }
 
   // ──────────────────────────────────────────────────────────
-  //  ESTADO 1 – Configurar duración (60 s – 300 s)
+  //  ESTADO 1 – Config duración
   // ──────────────────────────────────────────────────────────
   else if (estado == 1) {
     if (oledNuevo) { pantallaCfgTiempo(); oledNuevo=false; }
-
     if (antB1==HIGH && actB1==LOW && (ahora-tB1 > DB)) {
       if (cfgTiempo > 60)  { cfgTiempo-=10; oledNuevo=true; }
       else                 { encenderBuz(1000); encenderRGB(rgb.Color(255,0,0), 1000); }
@@ -362,18 +350,16 @@ void loop() {
       tB2=ahora;
     }
     if (antB3==HIGH && actB3==LOW && (ahora-tB3 > DB)) {
-      estado=2; cfgReps=5; oledNuevo=true;
-      tB3=ahora;
+      estado=2; cfgReps=5; oledNuevo=true; tB3=ahora;
     }
     antB1=actB1; antB2=actB2; antB3=actB3;
   }
 
   // ──────────────────────────────────────────────────────────
-  //  ESTADO 2 – Configurar repeticiones (3 – 12)
+  //  ESTADO 2 – Config repeticiones
   // ──────────────────────────────────────────────────────────
   else if (estado == 2) {
     if (oledNuevo) { pantallaCfgReps(); oledNuevo=false; }
-
     if (antB1==HIGH && actB1==LOW && (ahora-tB1 > DB)) {
       if (cfgReps > 3)  { cfgReps--; oledNuevo=true; }
       else              { encenderBuz(1000); encenderRGB(rgb.Color(255,0,0), 1000); }
@@ -385,27 +371,34 @@ void loop() {
       tB2=ahora;
     }
     if (antB3==HIGH && actB3==LOW && (ahora-tB3 > DB)) {
-      estado=3; oledNuevo=true; dcClics=0;
-      tB3=ahora;
+      estado=3; oledNuevo=true; dcClics=0; tB3=ahora;
     }
     antB1=actB1; antB2=actB2; antB3=actB3;
   }
 
   // ──────────────────────────────────────────────────────────
-  //  ESTADO 3 – Resumen + esperar doble clic BTN1
+  //  ESTADO 3 – Resumen + doble clic BTN1
   // ──────────────────────────────────────────────────────────
   else if (estado == 3) {
     if (oledNuevo) { pantallaResumen(); oledNuevo=false; }
-
     if (antB1==HIGH && actB1==LOW && (ahora-tB1 > DB)) {
       if (dcClics==0 || (ahora - dcPrimero) > 500) {
         dcClics=1; dcPrimero=ahora;
       } else {
         totTiempo=cfgTiempo; totReps=cfgReps; repsHechas=0;
-        tInicio=ahora; acumPausa=0; enPausa=false;
+        tInicio=ahora; acumPausa=0;
+        // Capturar estado actual de SW1 antes de entrar a terapia
+        antSW1 = digitalRead(SW1);
+        if (antSW1 == LOW) {   // switch ya en posición 0 → empezar pausado
+          enPausa=true; tPausa=ahora;
+          digitalWrite(LED1, HIGH);
+        } else {
+          enPausa=false;
+          digitalWrite(LED1, LOW);
+        }
         avisoActivado=false; avisoActivo=false;
+        lastSlOled=-1; lastRepsOled=-1; lastPausOled=!enPausa;
         estado=4; oledNuevo=true; dcClics=0;
-        // display se activa solo: actualizarMux() corre cuando estado==4
       }
       tB1=ahora;
     }
@@ -419,96 +412,104 @@ void loop() {
     bool sw1 = digitalRead(SW1);
     bool sw2 = digitalRead(SW2);
 
-    // SW1: LOW=pausar, HIGH=reanudar
-    if (sw1 == LOW && !enPausa) {
-      enPausa=true; tPausa=ahora;
-      digitalWrite(LED1, HIGH);
-      oledNuevo=true;
-    } else if (sw1 == HIGH && enPausa) {
-      enPausa=false; acumPausa += (ahora - tPausa);
-      digitalWrite(LED1, LOW);
+    // ── SW1: edge detection → pausa/resume confiable ──────
+    if (sw1 != antSW1) {
+      antSW1 = sw1;
+      if (sw1 == LOW) {          // flanco LOW → SW1 pasó a 0 → pausar
+        enPausa=true; tPausa=ahora;
+        digitalWrite(LED1, HIGH);
+      } else {                   // flanco HIGH → SW1 pasó a 1 → reanudar
+        if (enPausa) {
+          acumPausa += (ahora - tPausa);
+          enPausa=false;
+        }
+        digitalWrite(LED1, LOW);
+      }
       oledNuevo=true;
     }
 
-    // SW2 controla LED2 y qué se muestra en 7-seg
+    // ── SW2: LED2 y contenido del 7-seg ───────────────────
     if (sw2 == LOW) {
       digitalWrite(LED2, HIGH);
-      mostrarReps(repsHechas);      // SW2=0 → repeticiones
+      mostrarReps(repsHechas);
     } else {
       digitalWrite(LED2, LOW);
-      mostrarTiempo(segsRestantes(ahora));  // SW2=1 → tiempo M:SS
+      mostrarTiempo(segsRestantes(ahora));
     }
 
     int sl = segsRestantes(ahora);
 
-    // ── Aviso 15 segundos ─────────────────────────────────────
+    // ── Aviso 15 segundos ─────────────────────────────────
     if (!avisoActivado && !enPausa && sl <= 15 && sl > 0) {
       avisoActivado=true; avisoActivo=true;
       tAvisoInicio=ahora; tAvisoFlash=ahora; avisoFlashOn=false;
       oledNuevo=true;
     }
 
-    // ── Flash 1.33 Hz (375 ms on/off) durante 4 segundos ─────
+    // ── Flash 1.33Hz (375ms on/off), 4 segundos ───────────
     if (avisoActivo) {
       if (ahora - tAvisoInicio >= 4000) {
         avisoActivo=false;
         ledcWrite(BUZZER, 0);
         rgb.setPixelColor(0, 0); rgb.show();
+        oledNuevo=true;    // volver a pantalla normal
       } else if (ahora - tAvisoFlash >= 375) {
         avisoFlashOn = !avisoFlashOn;
         tAvisoFlash  = ahora;
-        ledcWrite(BUZZER, avisoFlashOn ? 128 : 0);   // 50% duty en warning
+        ledcWrite(BUZZER, avisoFlashOn ? 128 : 0);
         rgb.setPixelColor(0, avisoFlashOn ? rgb.Color(255,200,0) : 0);
         rgb.show();
       }
     }
 
-    // ── Doble clic BTN1: +1 repetición ───────────────────────
+    // ── Doble clic BTN1: +1 repetición ───────────────────
     if (antB1==HIGH && actB1==LOW && (ahora-tB1 > DB)) {
       if (dcClics==0 || (ahora - dcPrimero) > 500) {
         dcClics=1; dcPrimero=ahora;
       } else {
         repsHechas++; dcClics=0;
-        encenderBuz(800);
-        encenderRGB(rgb.Color(0,0,255), 800);
+        encenderBuz(800); encenderRGB(rgb.Color(0,0,255), 800);
         oledNuevo=true;
       }
       tB1=ahora;
     }
     antB1=actB1;
 
-    // ── BTN3: interrumpir sesión ──────────────────────────────
+    // ── BTN3: interrumpir ─────────────────────────────────
     if (antB3==HIGH && actB3==LOW && (ahora-tB3 > DB)) {
       razonFin=3; estado=5;
       avisoActivo=false; ledcWrite(BUZZER, 0);
       encenderBuz(2000);
       digitalWrite(LED1, LOW); digitalWrite(LED2, LOW);
-      apagarDisplay();   // ← 7-seg se apaga al salir del estado 4
-      oledNuevo=true; tB3=ahora;
+      apagarDisplay(); oledNuevo=true; tB3=ahora;
     }
     antB3=actB3;
 
-    // ── Fin automático ────────────────────────────────────────
+    // ── Fin automático ────────────────────────────────────
     if (repsHechas >= totReps) {
       razonFin=1; estado=5;
       avisoActivo=false; ledcWrite(BUZZER, 0);
       encenderBuz(2000);
       digitalWrite(LED1, LOW); digitalWrite(LED2, LOW);
-      apagarDisplay();
-      oledNuevo=true;
+      apagarDisplay(); oledNuevo=true;
     } else if (sl <= 0) {
       razonFin=2; estado=5;
       avisoActivo=false; ledcWrite(BUZZER, 0);
       encenderBuz(2000);
       digitalWrite(LED1, LOW); digitalWrite(LED2, LOW);
-      apagarDisplay();
-      oledNuevo=true;
+      apagarDisplay(); oledNuevo=true;
     }
 
-    // ── OLED periódico (cada 500 ms o al cambiar algo) ────────
+    // ── OLED: redibujar SOLO cuando cambia el contenido ───
+    // Esto evita el parpadeo del 7-seg causado por el bloqueo I2C
     if (estado == 4) {
-      if (oledNuevo || (ahora - tOled >= 500)) {
-        tOled = ahora;
+      if (oledNuevo
+          || sl          != lastSlOled
+          || repsHechas  != lastRepsOled
+          || enPausa     != lastPausOled) {
+        lastSlOled   = sl;
+        lastRepsOled = repsHechas;
+        lastPausOled = enPausa;
         if (avisoActivo) pantallaAviso(sl);
         else             pantallaTerapia(sl, enPausa);
         oledNuevo = false;
@@ -521,9 +522,8 @@ void loop() {
   // ──────────────────────────────────────────────────────────
   else if (estado == 5) {
     if (oledNuevo) { pantallaFin(); oledNuevo=false; }
-    // BTN4 maneja la salida globalmente arriba
   }
 
-  // ── Apagar buzzer/RGB cuando vence su timer ───────────────
   actualizarBuzRGB(millis());
 }
+
