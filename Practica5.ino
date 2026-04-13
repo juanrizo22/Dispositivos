@@ -15,6 +15,7 @@ Adafruit_NeoPixel rgb(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // Pines del display y botones
 const int segPins[7] = {19, 21, 36, 35, 38, 20, 37};
+const int DP_PIN = 17;         // pin del punto decimal
 const int digPins[4] = {2, 42, 41, 40};
 const int LED1=15, LED2=16, BUZZER=3;
 const int BTN1=4, BTN2=5, BTN3=6, BTN4=7;
@@ -26,6 +27,7 @@ const uint8_t SEG[10] = {
   0b0010010,0b0000010,0b1111000,0b0000000,0b0010000};
 const uint8_t SEG_OFF = 0b1111111;
 uint8_t dispBuf[4] = {SEG_OFF,SEG_OFF,SEG_OFF,SEG_OFF};
+bool dpBuf[4]   = {false,false,false,false}; // punto decimal por dígito
 int digActual = 0;
 
 // ── TIMER HARDWARE ──────────────────────────────────────────────────────────
@@ -97,15 +99,18 @@ void actualizarSalidas() {
 
 void apagarDisplay() {
   for (int i=0;i<4;i++) digitalWrite(digPins[i], LOW);
+  digitalWrite(DP_PIN, HIGH); // ánodo común: HIGH = DP apagado
 }
 
-// Multiplexado: llamar cada 1ms (disparado por flagMux)
+// Multiplexado: llamar cada 1ms (disparado por flagTick)
 void mux() {
   // Apagar dígito anterior
   digitalWrite(digPins[digActual], LOW);
   digActual = (digActual + 1) % 4;
   // Escribir segmentos del dígito actual
   for (int s=0;s<7;s++) digitalWrite(segPins[s], (dispBuf[digActual]>>s)&1);
+  // Punto decimal: ánodo común → LOW = encendido, HIGH = apagado
+  digitalWrite(DP_PIN, dpBuf[digActual] ? LOW : HIGH);
   // Encender dígito (ánodo común: HIGH = encendido)
   digitalWrite(digPins[digActual], HIGH);
 }
@@ -116,6 +121,11 @@ void mostrarTiempo(int s) {
   dispBuf[1] = SEG[m%10];
   dispBuf[2] = SEG[s/10];
   dispBuf[3] = SEG[s%10];
+  // Punto decimal en dígito 1 → muestra MM.SS
+  dpBuf[0] = false;
+  dpBuf[1] = true;
+  dpBuf[2] = false;
+  dpBuf[3] = false;
 }
 
 void mostrarReps(int r) {
@@ -123,6 +133,7 @@ void mostrarReps(int r) {
   dispBuf[1] = SEG_OFF;
   dispBuf[2] = SEG[r/10];
   dispBuf[3] = SEG[r%10];
+  dpBuf[0] = dpBuf[1] = dpBuf[2] = dpBuf[3] = false; // sin punto en modo reps
 }
 
 // ── TIEMPO RESTANTE ──────────────────────────────────────────────────────────
@@ -255,8 +266,9 @@ void terminarTerapia(int razon) {
 // ── SETUP ────────────────────────────────────────────────────────────────────
 
 void setup() {
-  // Segmentos y dígitos
+  // Segmentos, punto decimal y dígitos
   for (int i=0;i<7;i++) { pinMode(segPins[i],OUTPUT); digitalWrite(segPins[i],HIGH); }
+  pinMode(DP_PIN, OUTPUT); digitalWrite(DP_PIN, HIGH); // DP apagado al inicio
   for (int i=0;i<4;i++) { pinMode(digPins[i],OUTPUT); digitalWrite(digPins[i],LOW); }
 
   // LEDs, buzzer, botones, switches
@@ -453,3 +465,4 @@ void loop() {
     if (pulB4) volverAlMenu();
   }
 }
+
