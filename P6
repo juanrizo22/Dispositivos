@@ -1,594 +1,271 @@
-/* =========================================================================
-   PRACTICA 6 - Monitor de ventilador pulmonar
-   ESP32-S3
-   - Sin millis(): toda temporizacion con timers de hardware
-   - Interrupciones solo levantan banderas
-   - Sin float: valores escalados (x10 para presion, x100 para O2 y flujo)
-   - Atenuacion 11 dB configurada por pin (no global)
-   ========================================================================= */
-
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
 
-/* -------------------- PINES -------------------- */
-// ADC1 en ESP32-S3 (GPIO1..GPIO10). Usar ADC1 para evitar conflicto con WiFi.
-#define PIN_POT1      4    // Presion
-#define PIN_POT2      5    // Oxigeno
-#define PIN_POT3      6    // Flujo de aire
+// --- PINES ---
+#define PIN_POT1      4    // Presión (ÚNICO ACTIVO)
+// #define PIN_POT2      5    // Oxígeno (COMENTADO)
+// #define PIN_POT3      6    // Flujo (COMENTADO)
+#define PIN_SW1       17   // Rango de seguridad
+#define PIN_SW2       15   // Unidades (cmH2O / mmHg)
+// #define PIN_SW3       16   // SW Registros (COMENTADO)
+#define PIN_BTN1      18   // Ir a Medición
+#define PIN_BTN2      13   // Ir a Registros (Inactivo por ahora)
+#define PIN_BTN3      46   // Volver al Menú
+#define PIN_BUZZER    10
+#define PIN_LED_NEG   14   // LED Polaridad (No se usa en medición directa)
+#define PIN_NEOPIXEL  48   
 
-// Switches
-#define PIN_SW1       15   // Rango de seguridad
-#define PIN_SW2       16   // cmH2O / mmHg
-#define PIN_SW3       17   // Elegir / borrar registro
-
-// Botones
-#define PIN_BTN1      10   // Opcion 1 / guardar / apuntador abajo
-#define PIN_BTN2      11   // Opcion 2 / elegir-borrar
-#define PIN_BTN3      12   // Volver al menu principal
-
-// Actuadores
-#define PIN_BUZZER    7
-#define PIN_LED_NEG   14   // LED indicador de valor negativo en registro
-#define PIN_NEOPIXEL  48   // LED RGB integrado ESP32-S3
-
-// OLED
 #define ANCHO_OLED    128
 #define ALTO_OLED     64
-#define OLED_RESET    -1
+#define OLED_RESET    -1 
 #define OLED_ADDR     0x3C
 
 Adafruit_SSD1306 oled(ANCHO_OLED, ALTO_OLED, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
-/* -------------------- ESTADOS DEL SISTEMA -------------------- */
-enum Pantalla { MENU_PRINCIPAL, MEDIR, VER_REGISTROS, DETALLE_REGISTRO };
+// --- ESTADOS ---
+enum Pantalla { MENU_PRINCIPAL, MEDIR, VER_REGISTROS };
 volatile Pantalla pantallaActual = MENU_PRINCIPAL;
-
 enum Alerta { NORMAL, ADVERTENCIA, CRITICO };
 Alerta estadoAlerta = NORMAL;
 
-/* -------------------- TIMERS -------------------- */
-// timerMuestreo:   15 Hz  -> toma de una muestra del ADC
-// timerSegundo:    1  Hz  -> promedia, actualiza OLED y refresca lecturas
-// timerTick:      20 Hz (50 ms) -> base para parpadeo LED, buzzer y antirebote
+// --- TIMERS Y BANDERAS ---
 hw_timer_t *timerMuestreo = NULL;
 hw_timer_t *timerSegundo  = NULL;
 hw_timer_t *timerTick     = NULL;
 
-/* -------------------- BANDERAS (solo modificadas por ISR) -------------------- */
-volatile bool flagMuestreo = false;
-volatile bool flagSegundo  = false;
-volatile bool flagTick     = false;
+volatile bool flagMuestreo = false, flagSegundo = false, flagTick = false;
+volatile bool flagBtn1 = false, flagBtn2 = false, flagBtn3 = false;
+bool sistemaListo = false; // Bloqueo de ruido al arrancar
 
-volatile bool flagBtn1 = false;
-volatile bool flagBtn2 = false;
-volatile bool flagBtn3 = false;
-
-/* -------------------- ISRs (SOLO BANDERAS) -------------------- */
-void IRAM_ATTR ISR_Muestreo() { flagMuestreo = true; }
+// --- ISRs ---
+void IRAM_ATTR ISR_Muestreo(){ flagMuestreo = true; }
 void IRAM_ATTR ISR_Segundo()  { flagSegundo  = true; }
 void IRAM_ATTR ISR_Tick()     { flagTick     = true; }
+void IRAM_ATTR ISR_Btn1() { if(sistemaListo) flagBtn1 = true; }
+void IRAM_ATTR ISR_Btn2() { if(sistemaListo) flagBtn2 = true; }
+void IRAM_ATTR ISR_Btn3() { if(sistemaListo) flagBtn3 = true; }
 
-void IRAM_ATTR ISR_Btn1() { flagBtn1 = true; }
-void IRAM_ATTR ISR_Btn2() { flagBtn2 = true; }
-void IRAM_ATTR ISR_Btn3() { flagBtn3 = true; }
-
-/* -------------------- BUFFERS DE MUESTREO -------------------- */
-// Se acumulan 15 lecturas en mV, luego se promedian al dispararse flagSegundo.
-#define N_MUESTRAS   15
-uint32_t acum1 = 0, acum2 = 0, acum3 = 0;
+// --- VARIABLES DE DATOS ---
+uint32_t acum1 = 0; // Solo acumulador de presión
 uint8_t  nMuestras = 0;
+int16_t  adc1_raw = 0;
+int16_t  presion_x10 = 0;   
+bool     presionEsMmHg = false;
+bool     alertaP = false;
 
-// Voltajes promediados (mV) listos para convertir
-int16_t  volt1_mV = 0;
-int16_t  volt2_mV = 0;
-int16_t  volt3_mV = 0;
+// --- GESTIÓN DE TIEMPOS ---
+uint8_t contadorParpadeo = 0, debBtn1 = 0, debBtn2 = 0, debBtn3 = 0;
+bool ledAmarilloOn = false;
+uint16_t contadorBuzzer = 0; 
 
-/* -------------------- VALORES ESCALADOS -------------------- */
-// Presion: rango -10.0 .. 35.0 cmH2O  ->  x10   (rango -100 .. 350)
-// Oxigeno: 0.00 .. 100.00 %           ->  x100  (rango 0 .. 10000)
-// Flujo:   25.00 .. 120.00 LPM        ->  x100  (rango 2500 .. 12000)
-int16_t  presion_x10 = 0;   // en cmH2O*10  (cambia a mmHg*10 si SW2=0)
-int16_t  oxigeno_x100 = 0;
-int16_t  flujo_x100 = 0;
-
-bool     presionEsMmHg = false;  // Copia de SW2 al momento de calcular
-
-/* -------------------- ALERTAS -------------------- */
-bool alertaP = false, alertaO = false, alertaF = false;
-uint8_t  contadorParpadeo = 0;   // Para parpadeo LED amarillo 2 Hz (cambia cada 250 ms = 5 ticks)
-bool     ledAmarilloOn = false;
-
-uint16_t contadorBuzzer = 0;     // Periodo 2500 ms = 50 ticks; 20% duty = 10 ticks
-bool     buzzerOn = false;
-
-/* -------------------- MENU OPCION 2 (REGISTROS) -------------------- */
+// --- ESTRUCTURA REGISTROS (COMENTADO) ---
+/*
 struct Registro {
-  bool     ocupado;
-  int16_t  presion_x10;
-  int16_t  oxigeno_x100;
-  int16_t  flujo_x100;
-  bool     alertaP;
-  bool     alertaO;
-  bool     alertaF;
-  bool     eraMmHg;
+  bool ocupado;
+  int16_t presion_x10;
+  bool alertaP, eraMmHg;
 };
 Registro registros[3];
-uint8_t  apuntadorReg = 0;
-uint8_t  registroElegido = 0;
+*/
 
-/* -------------------- ANTIREBOTE -------------------- */
-// Cada boton con su propio contador. Cuenta en ticks de 50 ms.
-// Un evento solo se acepta si el contador paso a 0 (ventana >= 2 ticks = 100 ms).
-uint8_t  debBtn1 = 0, debBtn2 = 0, debBtn3 = 0;
-#define DEB_TICKS  2
-
-/* ===================== SETUP ===================== */
 void setup() {
   Serial.begin(115200);
-
-  /* --- Pines de switches y botones --- */
   pinMode(PIN_SW1, INPUT_PULLUP);
   pinMode(PIN_SW2, INPUT_PULLUP);
-  pinMode(PIN_SW3, INPUT_PULLUP);
   pinMode(PIN_BTN1, INPUT_PULLUP);
   pinMode(PIN_BTN2, INPUT_PULLUP);
   pinMode(PIN_BTN3, INPUT_PULLUP);
-
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED_NEG, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
-  digitalWrite(PIN_LED_NEG, LOW);
 
-  /* --- ADC: atenuacion 11 dB POR PIN (no global) --- */
-  analogReadResolution(12);                       // 0..4095
-  analogSetPinAttenuation(PIN_POT1, ADC_11db);    // Rango util ~0..3.1 V
-  analogSetPinAttenuation(PIN_POT2, ADC_11db);
-  analogSetPinAttenuation(PIN_POT3, ADC_11db);
+  analogReadResolution(12); 
+  analogSetPinAttenuation(PIN_POT1, ADC_11db);
 
-  /* --- NeoPixel (LED RGB) --- */
   pixel.begin();
   pixel.setBrightness(40);
-  ponerColorRGB(0, 80, 0);    // Verde por defecto
-
-  /* --- OLED --- */
-  Wire.begin();                                   // SDA/SCL por defecto ESP32-S3
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("OLED no detectada");
-    while (1);
-  }
+  
+  Wire.begin(); 
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) { for(;;); }
   oled.clearDisplay();
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(1);
   oled.display();
 
-  /* --- Interrupciones de botones (flanco de bajada, pull-up) --- */
+  // Timers
+  timerMuestreo = timerBegin(1000000);
+  timerAttachInterrupt(timerMuestreo, &ISR_Muestreo);
+  timerAlarm(timerMuestreo, 66667, true, 0); 
+
+  timerSegundo = timerBegin(1000000);
+  timerAttachInterrupt(timerSegundo, &ISR_Segundo);
+  timerAlarm(timerSegundo, 1000000, true, 0); 
+
+  timerTick = timerBegin(1000000);
+  timerAttachInterrupt(timerTick, &ISR_Tick);
+  timerAlarm(timerTick, 50000, true, 0); 
+
+  // --- PREVENCIÓN DE SALTOS AL CONECTAR ---
+  delay(1000); 
   attachInterrupt(digitalPinToInterrupt(PIN_BTN1), ISR_Btn1, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN2), ISR_Btn2, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN3), ISR_Btn3, FALLING);
-
-  /* --- Timers de hardware (API ESP32 Core 3.x) ---
-     timerBegin(frecuencia_en_Hz): resolucion de la cuenta.
-     timerAlarm(timer, cuenta, autoreload, limite). */
-
-  // Muestreo a 15 Hz: base 1 MHz -> 66667 us
-  timerMuestreo = timerBegin(1000000);
-  timerAttachInterrupt(timerMuestreo, &ISR_Muestreo);
-  timerAlarm(timerMuestreo, 66667, true, 0);
-
-  // 1 segundo: base 1 MHz -> 1 000 000 us
-  timerSegundo = timerBegin(1000000);
-  timerAttachInterrupt(timerSegundo, &ISR_Segundo);
-  timerAlarm(timerSegundo, 1000000, true, 0);
-
-  // Tick cada 50 ms: base 1 MHz -> 50 000 us
-  timerTick = timerBegin(1000000);
-  timerAttachInterrupt(timerTick, &ISR_Tick);
-  timerAlarm(timerTick, 50000, true, 0);
+  
+  flagBtn1 = false; flagBtn2 = false; flagBtn3 = false;
+  sistemaListo = true; 
 
   dibujarMenuPrincipal();
 }
 
-/* ===================== LOOP ===================== */
 void loop() {
-
-  /* ---------- Muestreo ADC (15 Hz) ---------- */
   if (flagMuestreo) {
     flagMuestreo = false;
     if (pantallaActual == MEDIR) {
-      acum1 += analogReadMilliVolts(PIN_POT1);
-      acum2 += analogReadMilliVolts(PIN_POT2);
-      acum3 += analogReadMilliVolts(PIN_POT3);
+      acum1 += analogRead(PIN_POT1);
       nMuestras++;
     }
   }
 
-  /* ---------- Cada segundo ---------- */
   if (flagSegundo) {
     flagSegundo = false;
     if (pantallaActual == MEDIR && nMuestras > 0) {
-      volt1_mV = acum1 / nMuestras;
-      volt2_mV = acum2 / nMuestras;
-      volt3_mV = acum3 / nMuestras;
-      acum1 = acum2 = acum3 = 0;
-      nMuestras = 0;
-
+      adc1_raw = acum1 / nMuestras;
+      acum1 = 0; nMuestras = 0;
       calcularVariables();
       evaluarAlertas();
       dibujarMediciones();
     }
   }
 
-  /* ---------- Tick 50 ms: parpadeo, buzzer, antirebote ---------- */
   if (flagTick) {
     flagTick = false;
     gestionarAlertaLED();
     gestionarBuzzer();
-    if (debBtn1 > 0) debBtn1--;
-    if (debBtn2 > 0) debBtn2--;
+    if (debBtn1 > 0) debBtn1--; 
+    if (debBtn2 > 0) debBtn2--; 
     if (debBtn3 > 0) debBtn3--;
   }
 
-  /* ---------- Botones (con antirebote por software) ---------- */
-  if (flagBtn1) {
-    flagBtn1 = false;
-    if (debBtn1 == 0) { debBtn1 = DEB_TICKS; manejarBoton1(); }
+  // --- BOTONES ---
+  if (flagBtn1) { 
+    flagBtn1 = false; 
+    if (debBtn1 == 0) { debBtn1 = 10; manejarBoton1(); } 
   }
-  if (flagBtn2) {
-    flagBtn2 = false;
-    if (debBtn2 == 0) { debBtn2 = DEB_TICKS; manejarBoton2(); }
+  if (flagBtn2) { 
+    flagBtn2 = false; 
+    if (debBtn2 == 0) { debBtn2 = 10; manejarBoton2(); } 
   }
-  if (flagBtn3) {
-    flagBtn3 = false;
-    if (debBtn3 == 0) { debBtn3 = DEB_TICKS; manejarBoton3(); }
+  if (flagBtn3) { 
+    flagBtn3 = false; 
+    if (debBtn3 == 0) { debBtn3 = 10; manejarBoton3(); } 
   }
 }
 
-/* ===================== CALCULO DE VARIABLES =====================
-   Todo entero. Voltaje de entrada en mV (0..3100 con atenuacion 11 dB).
-   Resultado escalado:
-     presion_x10   : cmH2O*10 o mmHg*10 (segun SW2)
-     oxigeno_x100  : %*100
-     flujo_x100    : LPM*100
-   ================================================================= */
 void calcularVariables() {
-
-  /* --- PRESION ---
-     Rango -10..35 cmH2O.
-     Dos tramos:
-       V <= 880 mV   : sensibilidad 110 mV/cmH2O   (desde -10 hasta -2)
-       V >  880 mV   : sensibilidad 32.25 mV/cmH2O (desde -2 hasta 35)
-     Tip: trabajar en cmH2O*10 para conservar 1 decimal.
-  */
-  int16_t p_x10;
-  if (volt1_mV <= 880) {
-    // TODO: tramo 1 (sensibilidad 110 mV/cmH2O, offset -10 cmH2O)
-    // p_x10 = /* COMPLETAR */ ;
-    p_x10 = 0;  // <-- reemplazar
+  // --- PRESIÓN ---
+  int32_t p_x10;
+  if (adc1_raw <= 1056) { 
+    p_x10 = ((int32_t)adc1_raw * 10 - 13200) / 132;
   } else {
-    // TODO: tramo 2 (sensibilidad 32.25 mV/cmH2O, origen en -2 cmH2O = 880 mV)
-    // p_x10 = /* COMPLETAR */ ;
-    p_x10 = 0;  // <-- reemplazar
+    p_x10 = ((int32_t)adc1_raw * 370 - 422260) / 1577;
   }
-  // Saturar al maximo 35.0 cmH2O
-  if (p_x10 > 350)  p_x10 = 350;
+  
+  if (p_x10 > 350)  p_x10 = 350; 
   if (p_x10 < -100) p_x10 = -100;
 
-  // Conversion a mmHg si SW2 = 0 (pull-up: LOW = 0 = mmHg)
   presionEsMmHg = (digitalRead(PIN_SW2) == LOW);
   if (presionEsMmHg) {
-    // 1 cmH2O = 0.7356 mmHg aprox.
-    // TODO: convertir p_x10 (cmH2O*10) a mmHg*10 usando aritmetica entera.
-    // Ej: p_x10 = (p_x10 * 7356) / 10000;  (verificar overflow, usar int32_t si necesario)
-    // p_x10 = /* COMPLETAR */ ;
-  }
-  presion_x10 = p_x10;
-
-  /* --- OXIGENO ---
-     Rango 0..100 %, sensibilidad 22.2 mV/1%.
-     oxigeno_x100 = %*100  (dos decimales).
-  */
-  int32_t o_x100;
-  // TODO: o_x100 = /* COMPLETAR usando volt2_mV y 22.2 mV/% */ ;
-  // Ej: o_x100 = ((int32_t)volt2_mV * 1000) / 222;
-  o_x100 = 0;  // <-- reemplazar
-  if (o_x100 > 10000) o_x100 = 10000;
-  if (o_x100 < 0)     o_x100 = 0;
-  oxigeno_x100 = (int16_t)o_x100;
-
-  /* --- FLUJO ---
-     Rango 25..120 LPM, sensibilidad 18.5 mV/LPM.
-     flujo_x100 = LPM*100.
-  */
-  int32_t f_x100;
-  // TODO: f_x100 = /* COMPLETAR usando volt3_mV y 18.5 mV/LPM */ ;
-  // Ej: f_x100 = ((int32_t)volt3_mV * 1000) / 185;
-  f_x100 = 0;  // <-- reemplazar
-  if (f_x100 > 12000) f_x100 = 12000;
-  if (f_x100 < 2500)  f_x100 = 2500;   // limite inferior del sensor
-  flujo_x100 = (int16_t)f_x100;
-}
-
-/* ===================== EVALUAR ALERTAS ===================== */
-void evaluarAlertas() {
-  // Limites segun SW1 (pull-up: HIGH = 1)
-  bool sw1 = (digitalRead(PIN_SW1) == HIGH);
-
-  // Limites de presion expresados en cmH2O*10.
-  // Si SW2 esta en mmHg, los limites se comparan convirtiendo presion de mmHg a cmH2O.
-  int16_t pMin_x10, pMax_x10;
-  int16_t oMin_x100, oMax_x100;
-  int16_t fMin_x100, fMax_x100;
-  if (sw1) {
-    pMin_x10 = 50;   pMax_x10 = 260;
-    oMin_x100 = 2100; oMax_x100 = 9500;
-    fMin_x100 = 3300; fMax_x100 = 9000;
+    presion_x10 = (int16_t)((p_x10 * 7356) / 10000); 
   } else {
-    pMin_x10 = 30;   pMax_x10 = 200;
-    oMin_x100 = 3000; oMax_x100 = 9000;
-    fMin_x100 = 2000; fMax_x100 = 10000;
+    presion_x10 = (int16_t)p_x10;
   }
-
-  // Para comparar, si la presion esta en mmHg, reconvertir a cmH2O*10
-  int16_t pParaComparar = presion_x10;
-  if (presionEsMmHg) {
-    // TODO: reconvertir p_x10 (mmHg*10) a cmH2O*10 para comparar
-    // Ej: pParaComparar = (int32_t)presion_x10 * 10000 / 7356;
-    // pParaComparar = /* COMPLETAR */ ;
-  }
-
-  alertaP = (pParaComparar < pMin_x10) || (pParaComparar > pMax_x10);
-  alertaO = (oxigeno_x100 < oMin_x100) || (oxigeno_x100 > oMax_x100);
-  alertaF = (flujo_x100   < fMin_x100) || (flujo_x100   > fMax_x100);
-
-  uint8_t nAlertas = (alertaP ? 1 : 0) + (alertaO ? 1 : 0) + (alertaF ? 1 : 0);
-  if      (nAlertas == 0) estadoAlerta = NORMAL;
-  else if (nAlertas == 1) estadoAlerta = ADVERTENCIA;
-  else                    estadoAlerta = CRITICO;
 }
 
-/* ===================== GESTION LED RGB =====================
-   Verde fijo  -> NORMAL
-   Amarillo 2 Hz -> ADVERTENCIA  (toggle cada 250 ms = 5 ticks)
-   Rojo fijo   -> CRITICO
-   Se ejecuta cada 50 ms (tick).
-   =========================================================== */
-void gestionarAlertaLED() {
-  if (pantallaActual != MEDIR) {
-    ponerColorRGB(0, 0, 0);     // Apagado fuera del modo medicion
-    return;
+void evaluarAlertas() {
+  bool sw1 = (digitalRead(PIN_SW1) == HIGH);
+  int16_t pMin, pMax;
+
+  if (sw1) { pMin = 50; pMax = 260; } 
+  else { pMin = 30; pMax = 200; }
+
+  int16_t pComp = presion_x10;
+  if (presionEsMmHg) pComp = (int16_t)(((int32_t)presion_x10 * 10000) / 7356);
+
+  alertaP = (pComp < pMin || pComp > pMax);
+
+  // Como solo hay un sensor, pasamos a CRITICO solo para probar buzzer si alertaP es true
+  // (Nota: La guía pide 2 sensores para crítico, pero aquí lo forzamos para probar)
+  if (alertaP) {
+    estadoAlerta = ADVERTENCIA; 
+    // Si quieres probar el modo CRITICO con un solo sensor, descomenta la linea de abajo:
+    // estadoAlerta = CRITICO; 
+  } else {
+    estadoAlerta = NORMAL;
   }
+}
+
+void gestionarAlertaLED() {
+  if (pantallaActual != MEDIR) { ponerColorRGB(0,0,0); return; }
   switch (estadoAlerta) {
-    case NORMAL:
-      ponerColorRGB(0, 80, 0);
-      contadorParpadeo = 0;
-      ledAmarilloOn = false;
-      break;
+    case NORMAL: ponerColorRGB(0, 80, 0); contadorParpadeo = 0; break;
     case ADVERTENCIA:
-      contadorParpadeo++;
-      if (contadorParpadeo >= 5) {          // 5 * 50 ms = 250 ms -> 2 Hz
-        contadorParpadeo = 0;
-        ledAmarilloOn = !ledAmarilloOn;
-        if (ledAmarilloOn) ponerColorRGB(120, 80, 0);
-        else               ponerColorRGB(0, 0, 0);
+      if (++contadorParpadeo >= 5) { // 2 Hz (cada 250ms)
+        contadorParpadeo = 0; ledAmarilloOn = !ledAmarilloOn;
+        if (ledAmarilloOn) ponerColorRGB(120, 80, 0); else ponerColorRGB(0, 0, 0);
       }
       break;
-    case CRITICO:
-      ponerColorRGB(150, 0, 0);
-      contadorParpadeo = 0;
-      ledAmarilloOn = false;
-      break;
+    case CRITICO: ponerColorRGB(150, 0, 0); break;
   }
 }
 
-/* ===================== GESTION BUZZER =====================
-   Periodo 2500 ms, duty 20% -> 500 ms ON, 2000 ms OFF.
-   En ticks de 50 ms: 10 ticks ON, 40 ticks OFF, ciclo = 50.
-   Solo activo en estado CRITICO y pantalla MEDIR.
-   ========================================================= */
 void gestionarBuzzer() {
   if (pantallaActual != MEDIR || estadoAlerta != CRITICO) {
-    buzzerOn = false;
-    contadorBuzzer = 0;
-    digitalWrite(PIN_BUZZER, LOW);
-    return;
+    digitalWrite(PIN_BUZZER, LOW); contadorBuzzer = 0; return;
   }
   contadorBuzzer++;
-  if (contadorBuzzer < 10) {
-    buzzerOn = true;
-  } else if (contadorBuzzer < 50) {
-    buzzerOn = false;
-  } else {
-    contadorBuzzer = 0;
-    buzzerOn = true;
-  }
-  digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
+  if (contadorBuzzer <= 10) digitalWrite(PIN_BUZZER, HIGH); // 20% Duty
+  else digitalWrite(PIN_BUZZER, LOW);
+  if (contadorBuzzer >= 50) contadorBuzzer = 0; // Ciclo 2.5s
 }
 
 void ponerColorRGB(uint8_t r, uint8_t g, uint8_t b) {
-  pixel.setPixelColor(0, pixel.Color(r, g, b));
-  pixel.show();
+  pixel.setPixelColor(0, pixel.Color(r, g, b)); pixel.show();
 }
 
-/* ===================== BOTONES ===================== */
 void manejarBoton1() {
-  switch (pantallaActual) {
-    case MENU_PRINCIPAL:
-      pantallaActual = MEDIR;
-      acum1 = acum2 = acum3 = 0;
-      nMuestras = 0;
-      break;
-    case MEDIR:
-      guardarRegistroActual();
-      break;
-    case VER_REGISTROS:
-      apuntadorReg = (apuntadorReg + 1) % 3;
-      dibujarListaRegistros();
-      break;
-    default: break;
-  }
+  if (pantallaActual == MENU_PRINCIPAL) pantallaActual = MEDIR;
 }
 
 void manejarBoton2() {
-  switch (pantallaActual) {
-    case MENU_PRINCIPAL:
-      pantallaActual = VER_REGISTROS;
-      apuntadorReg = 0;
-      dibujarListaRegistros();
-      break;
-    case VER_REGISTROS: {
-      bool sw3 = (digitalRead(PIN_SW3) == HIGH);
-      if (sw3) {
-        // Elegir registro: solo si esta ocupado
-        if (registros[apuntadorReg].ocupado) {
-          registroElegido = apuntadorReg;
-          pantallaActual = DETALLE_REGISTRO;
-          dibujarDetalleRegistro();
-        }
-      } else {
-        // Borrar registro
-        registros[apuntadorReg].ocupado = false;
-        dibujarListaRegistros();
-      }
-      break;
-    }
-    default: break;
+  if (pantallaActual == MENU_PRINCIPAL) { 
+    pantallaActual = VER_REGISTROS; 
+    oled.clearDisplay(); oled.setCursor(0,0);
+    oled.println("Modo Registros"); oled.println("(No implementado)"); oled.display();
   }
 }
 
 void manejarBoton3() {
-  pantallaActual = MENU_PRINCIPAL;
-  digitalWrite(PIN_LED_NEG, LOW);
-  digitalWrite(PIN_BUZZER, LOW);
+  pantallaActual = MENU_PRINCIPAL; 
+  digitalWrite(PIN_BUZZER, LOW); 
   dibujarMenuPrincipal();
 }
 
-/* ===================== GUARDAR REGISTRO ===================== */
-void guardarRegistroActual() {
-  // Primer slot libre
-  for (uint8_t i = 0; i < 3; i++) {
-    if (!registros[i].ocupado) {
-      registros[i].ocupado     = true;
-      registros[i].presion_x10 = presion_x10;
-      registros[i].oxigeno_x100 = oxigeno_x100;
-      registros[i].flujo_x100  = flujo_x100;
-      registros[i].alertaP     = alertaP;
-      registros[i].alertaO     = alertaO;
-      registros[i].alertaF     = alertaF;
-      registros[i].eraMmHg     = presionEsMmHg;
-      // Flash breve del mensaje "Guardado" (se redibujara en el siguiente segundo)
-      oled.setCursor(0, 55);
-      oled.print("Guardado #");
-      oled.print(i + 1);
-      oled.display();
-      return;
-    }
-  }
+void imprimirV10(int16_t v) {
+  if (v < 0) { oled.print('-'); v = -v; }
+  oled.print(v / 10); oled.print('.'); oled.print(v % 10);
 }
 
-/* ===================== DIBUJO EN OLED ===================== */
 void dibujarMenuPrincipal() {
-  oled.clearDisplay();
-  oled.setCursor(0, 0);
-  oled.println("Selecciona Modo:");
-  oled.println("[1] Medicion");
-  oled.println("[2] Registros");
+  oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(1);
+  oled.setCursor(0, 0); oled.println("Selecciona Modo:");
+  oled.println("[1] Medicion"); oled.println("[2] Registros");
   oled.display();
 }
 
 void dibujarMediciones() {
-  oled.clearDisplay();
-  oled.setCursor(0, 0);
-  oled.print("P: ");
-  imprimirValorSigno_x10(presion_x10);
-  oled.print(presionEsMmHg ? " mmHg" : " cmH2O");
-  if (alertaP) oled.print(" !");
-
-  oled.setCursor(0, 12);
-  oled.print("O: ");
-  imprimirValor_x100(oxigeno_x100);
-  oled.print(" %");
-  if (alertaO) oled.print(" !");
-
-  oled.setCursor(0, 24);
-  oled.print("F: ");
-  imprimirValor_x100(flujo_x100);
-  oled.print(" LPM");
-  if (alertaF) oled.print(" !");
-
+  oled.clearDisplay(); oled.setCursor(0, 0);
+  oled.print("P: "); imprimirV10(presion_x10); 
+  oled.print(presionEsMmHg ? " mmHg" : " cmH2O"); 
+  if (alertaP) oled.print(" !!!");
   oled.display();
-}
-
-void dibujarListaRegistros() {
-  oled.clearDisplay();
-  for (uint8_t i = 0; i < 3; i++) {
-    oled.setCursor(0, i * 12);
-    oled.print(i == apuntadorReg ? "->" : "  ");
-    oled.print(" Registro ");
-    if (registros[i].ocupado) {
-      oled.print("#");
-      oled.print(i + 1);
-    } else {
-      oled.print("(Vacio)");
-    }
-  }
-  oled.display();
-}
-
-void dibujarDetalleRegistro() {
-  Registro &r = registros[registroElegido];
-
-  // LED indicador de polaridad: prende si algun valor del registro es negativo
-  bool hayNegativo = (r.presion_x10 < 0) || (r.oxigeno_x100 < 0) || (r.flujo_x100 < 0);
-  digitalWrite(PIN_LED_NEG, hayNegativo ? HIGH : LOW);
-
-  oled.clearDisplay();
-  oled.setCursor(0, 0);
-  oled.print("P: ");
-  imprimirValorSigno_x10(r.presion_x10);
-  oled.print(r.eraMmHg ? " mmHg" : " cmH2O");
-  if (r.alertaP) oled.print(" !");
-
-  oled.setCursor(0, 12);
-  oled.print("O: ");
-  imprimirValor_x100(r.oxigeno_x100);
-  oled.print(" %");
-  if (r.alertaO) oled.print(" !");
-
-  oled.setCursor(0, 24);
-  oled.print("F: ");
-  imprimirValor_x100(r.flujo_x100);
-  oled.print(" LPM");
-  if (r.alertaF) oled.print(" !");
-
-  oled.setCursor(90, 40);
-  oled.print("*REG");
-  oled.display();
-}
-
-/* ===================== IMPRESION DE VALORES ESCALADOS =====================
-   Reconstruye el valor decimal a partir del entero escalado usando /  y %.
-   ========================================================================= */
-
-// Valor con signo y un decimal (x10). Ej: -123 -> "-12.3"
-void imprimirValorSigno_x10(int16_t v) {
-  if (v < 0) { oled.print('-'); v = -v; }
-  int16_t ent = v / 10;
-  int16_t dec = v % 10;
-  oled.print(ent);
-  oled.print('.');
-  oled.print(dec);
-}
-
-// Valor positivo con dos decimales (x100). Ej: 5422 -> "54.22"
-void imprimirValor_x100(int16_t v) {
-  if (v < 0) { oled.print('-'); v = -v; }
-  int16_t ent = v / 100;
-  int16_t dec = v % 100;
-  oled.print(ent);
-  oled.print('.');
-  if (dec < 10) oled.print('0');
-  oled.print(dec);
 }
