@@ -3,83 +3,96 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
 
-// --- PINES ---
-#define PIN_POT1      4    // Presión (ÚNICO ACTIVO)
-// #define PIN_POT2      5    // Oxígeno (COMENTADO)
-// #define PIN_POT3      6    // Flujo (COMENTADO)
-#define PIN_SW1       17   // Rango de seguridad
-#define PIN_SW2       15   // Unidades (cmH2O / mmHg)
-// #define PIN_SW3       16   // SW Registros (COMENTADO)
+//  PINES 
+#define PIN_POT1      4    // Presión 
+// #define PIN_POT2      5    // Oxígeno 
+// #define PIN_POT3      6    // Flujo 
+#define PIN_SW1       7   // Rango de seguridad
+#define PIN_SW2       15   // Unidades (cmH2O a mmHg)
+// #define PIN_SW3       16   // SW Registros 
 #define PIN_BTN1      18   // Ir a Medición
-#define PIN_BTN2      13   // Ir a Registros (Inactivo por ahora)
+#define PIN_BTN2      13   // Ir a Registros 
 #define PIN_BTN3      46   // Volver al Menú
 #define PIN_BUZZER    10
-#define PIN_LED_NEG   14   // LED Polaridad (No se usa en medición directa)
+#define PIN_LED_NEG   17    
 #define PIN_NEOPIXEL  48   
 
 #define ANCHO_OLED    128
 #define ALTO_OLED     64
-#define OLED_RESET    -1 
+#define OLED_RESET    1 
 #define OLED_ADDR     0x3C
 
 Adafruit_SSD1306 oled(ANCHO_OLED, ALTO_OLED, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
-// --- ESTADOS ---
+//  ESTADOS 
 enum Pantalla { MENU_PRINCIPAL, MEDIR, VER_REGISTROS };
 volatile Pantalla pantallaActual = MENU_PRINCIPAL;
 enum Alerta { NORMAL, ADVERTENCIA, CRITICO };
 Alerta estadoAlerta = NORMAL;
 
-// --- TIMERS Y BANDERAS ---
+//  BANDERAS VOLATILES 
+volatile bool flagMuestreo = false, flagSegundo = false, flagTick = false;
+volatile bool fBtn1 = false, fBtn2 = false, fBtn3 = false;
+volatile bool sistemaListo = false;
+volatile uint8_t segundosTranscurridos = 0;
+
+//  ESTRUCTURA DE BOTONES CON APUNTADORES A FUNCIONES 
+struct Boton {
+  uint8_t pin;
+  volatile bool *flag;      // Apuntador a la bandera del botón
+  uint8_t deb;              // Contador de antirebote
+  void (*accion)();         // Apuntador a la función que debe ejecutar
+};
+
+// Prototipos de funciones para los botones
+void manejarBoton1();
+void manejarBoton2();
+void manejarBoton3();
+
+// Arreglo de botones
+Boton botones[] = {
+  {PIN_BTN1, &fBtn1, 0, manejarBoton1},
+  {PIN_BTN2, &fBtn2, 0, manejarBoton2},
+  {PIN_BTN3, &fBtn3, 0, manejarBoton3}
+};
+
+const uint8_t NUM_BOTONES = sizeof(botones) / sizeof(botones[0]);
+
+//  TIMERS 
 hw_timer_t *timerMuestreo = NULL;
 hw_timer_t *timerSegundo  = NULL;
 hw_timer_t *timerTick     = NULL;
 
-volatile bool flagMuestreo = false, flagSegundo = false, flagTick = false;
-volatile bool flagBtn1 = false, flagBtn2 = false, flagBtn3 = false;
-bool sistemaListo = false; // Bloqueo de ruido al arrancar
-
-// --- ISRs ---
+//  ISRs 
 void IRAM_ATTR ISR_Muestreo(){ flagMuestreo = true; }
-void IRAM_ATTR ISR_Segundo()  { flagSegundo  = true; }
-void IRAM_ATTR ISR_Tick()     { flagTick     = true; }
-void IRAM_ATTR ISR_Btn1() { if(sistemaListo) flagBtn1 = true; }
-void IRAM_ATTR ISR_Btn2() { if(sistemaListo) flagBtn2 = true; }
-void IRAM_ATTR ISR_Btn3() { if(sistemaListo) flagBtn3 = true; }
+void IRAM_ATTR ISR_Segundo()  { 
+  flagSegundo = true; 
+  if (!sistemaListo) {
+    if (++segundosTranscurridos >= 2) sistemaListo = true;
+  }
+}
+void IRAM_ATTR ISR_Tick() { flagTick = true; }
 
-// --- VARIABLES DE DATOS ---
-uint32_t acum1 = 0; // Solo acumulador de presión
+// ISRs individuales (necesarias para attachInterrupt)
+void IRAM_ATTR ISR_B1() { if(sistemaListo) fBtn1 = true; }
+void IRAM_ATTR ISR_B2() { if(sistemaListo) fBtn2 = true; }
+void IRAM_ATTR ISR_B3() { if(sistemaListo) fBtn3 = true; }
+
+//  VARIABLES DE DATOS 
+uint32_t acum1 = 0;
 uint8_t  nMuestras = 0;
-int16_t  adc1_raw = 0;
-int16_t  presion_x10 = 0;   
-bool     presionEsMmHg = false;
-bool     alertaP = false;
-
-// --- GESTIÓN DE TIEMPOS ---
-uint8_t contadorParpadeo = 0, debBtn1 = 0, debBtn2 = 0, debBtn3 = 0;
-bool ledAmarilloOn = false;
+int16_t  adc1_raw = 0, presion_x10 = 0;   
+bool     presionEsMmHg = false, alertaP = false;
+uint8_t  contadorParpadeo = 0;
+bool     ledAmarilloOn = false;
 uint16_t contadorBuzzer = 0; 
 
-// --- ESTRUCTURA REGISTROS (COMENTADO) ---
-/*
-struct Registro {
-  bool ocupado;
-  int16_t presion_x10;
-  bool alertaP, eraMmHg;
-};
-Registro registros[3];
-*/
-
 void setup() {
-  Serial.begin(115200);
+  for(int i=0; i<NUM_BOTONES; i++) pinMode(botones[i].pin, INPUT_PULLUP);
   pinMode(PIN_SW1, INPUT_PULLUP);
   pinMode(PIN_SW2, INPUT_PULLUP);
-  pinMode(PIN_BTN1, INPUT_PULLUP);
-  pinMode(PIN_BTN2, INPUT_PULLUP);
-  pinMode(PIN_BTN3, INPUT_PULLUP);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_LED_NEG, OUTPUT);
 
   analogReadResolution(12); 
   analogSetPinAttenuation(PIN_POT1, ADC_11db);
@@ -88,11 +101,10 @@ void setup() {
   pixel.setBrightness(40);
   
   Wire.begin(); 
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) { for(;;); }
+  oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   oled.clearDisplay();
   oled.display();
 
-  // Timers
   timerMuestreo = timerBegin(1000000);
   timerAttachInterrupt(timerMuestreo, &ISR_Muestreo);
   timerAlarm(timerMuestreo, 66667, true, 0); 
@@ -105,14 +117,9 @@ void setup() {
   timerAttachInterrupt(timerTick, &ISR_Tick);
   timerAlarm(timerTick, 50000, true, 0); 
 
-  // --- PREVENCIÓN DE SALTOS AL CONECTAR ---
-  delay(1000); 
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN1), ISR_Btn1, FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN2), ISR_Btn2, FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN3), ISR_Btn3, FALLING);
-  
-  flagBtn1 = false; flagBtn2 = false; flagBtn3 = false;
-  sistemaListo = true; 
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN1), ISR_B1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN2), ISR_B2, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN3), ISR_B3, FALLING);
 
   dibujarMenuPrincipal();
 }
@@ -141,117 +148,76 @@ void loop() {
     flagTick = false;
     gestionarAlertaLED();
     gestionarBuzzer();
-    if (debBtn1 > 0) debBtn1--; 
-    if (debBtn2 > 0) debBtn2--; 
-    if (debBtn3 > 0) debBtn3--;
-  }
+    
+    //  PROCESAMIENTO DE BOTONES CON APUNTADORES 
+    for (uint8_t i = 0; i < NUM_BOTONES; i++) {
+      Boton *pB = &botones[i]; // Apuntador al botón actual del arreglo
+      
+      if (pB>deb > 0) pB>deb; // Decrementar antirebote
 
-  // --- BOTONES ---
-  if (flagBtn1) { 
-    flagBtn1 = false; 
-    if (debBtn1 == 0) { debBtn1 = 10; manejarBoton1(); } 
-  }
-  if (flagBtn2) { 
-    flagBtn2 = false; 
-    if (debBtn2 == 0) { debBtn2 = 10; manejarBoton2(); } 
-  }
-  if (flagBtn3) { 
-    flagBtn3 = false; 
-    if (debBtn3 == 0) { debBtn3 = 10; manejarBoton3(); } 
+      if (*(pB>flag)) {         // Si la bandera (apuntada) es true
+        *(pB>flag) = false;     // Bajar la bandera usando el apuntador
+        if (pB>deb == 0) {
+          pB>deb = 10;          // Bloqueo antirebote
+          pB>accion();          // Ejecutar la función apuntada
+        }
+      }
+    }
   }
 }
 
+//  LÓGICA DE NEGOCIO 
 void calcularVariables() {
-  // --- PRESIÓN ---
   int32_t p_x10;
-  if (adc1_raw <= 1056) { 
-    p_x10 = ((int32_t)adc1_raw * 10 - 13200) / 132;
-  } else {
-    p_x10 = ((int32_t)adc1_raw * 370 - 422260) / 1577;
-  }
+  if (adc1_raw <= 1056) p_x10 = ((int32_t)adc1_raw * 10  13200) / 132;
+  else p_x10 = ((int32_t)adc1_raw * 370  422260) / 1577;
   
-  if (p_x10 > 350)  p_x10 = 350; 
-  if (p_x10 < -100) p_x10 = -100;
+  if (p_x10 > 350) p_x10 = 350; 
+  if (p_x10 < 100) p_x10 = 100;
 
   presionEsMmHg = (digitalRead(PIN_SW2) == LOW);
-  if (presionEsMmHg) {
-    presion_x10 = (int16_t)((p_x10 * 7356) / 10000); 
-  } else {
-    presion_x10 = (int16_t)p_x10;
-  }
+  if (presionEsMmHg) presion_x10 = (int16_t)((p_x10 * 7356) / 10000); 
+  else presion_x10 = (int16_t)p_x10;
 }
 
 void evaluarAlertas() {
   bool sw1 = (digitalRead(PIN_SW1) == HIGH);
-  int16_t pMin, pMax;
-
-  if (sw1) { pMin = 50; pMax = 260; } 
-  else { pMin = 30; pMax = 200; }
-
-  int16_t pComp = presion_x10;
-  if (presionEsMmHg) pComp = (int16_t)(((int32_t)presion_x10 * 10000) / 7356);
-
+  int16_t pMin = sw1 ? 50 : 30;
+  int16_t pMax = sw1 ? 260 : 200;
+  int16_t pComp = presionEsMmHg ? (int16_t)(((int32_t)presion_x10 * 10000) / 7356) : presion_x10;
   alertaP = (pComp < pMin || pComp > pMax);
-
-  // Como solo hay un sensor, pasamos a CRITICO solo para probar buzzer si alertaP es true
-  // (Nota: La guía pide 2 sensores para crítico, pero aquí lo forzamos para probar)
-  if (alertaP) {
-    estadoAlerta = ADVERTENCIA; 
-    // Si quieres probar el modo CRITICO con un solo sensor, descomenta la linea de abajo:
-    // estadoAlerta = CRITICO; 
-  } else {
-    estadoAlerta = NORMAL;
-  }
+  estadoAlerta = alertaP ? ADVERTENCIA : NORMAL;
 }
 
+//  ACTUADORES Y DIBUJO 
 void gestionarAlertaLED() {
   if (pantallaActual != MEDIR) { ponerColorRGB(0,0,0); return; }
-  switch (estadoAlerta) {
-    case NORMAL: ponerColorRGB(0, 80, 0); contadorParpadeo = 0; break;
-    case ADVERTENCIA:
-      if (++contadorParpadeo >= 5) { // 2 Hz (cada 250ms)
-        contadorParpadeo = 0; ledAmarilloOn = !ledAmarilloOn;
-        if (ledAmarilloOn) ponerColorRGB(120, 80, 0); else ponerColorRGB(0, 0, 0);
-      }
-      break;
-    case CRITICO: ponerColorRGB(150, 0, 0); break;
+  if (estadoAlerta == NORMAL) { ponerColorRGB(0, 80, 0); contadorParpadeo = 0; }
+  else if (estadoAlerta == ADVERTENCIA) {
+    if (++contadorParpadeo >= 5) {
+      contadorParpadeo = 0; ledAmarilloOn = !ledAmarilloOn;
+      ponerColorRGB(ledAmarilloOn ? 120 : 0, ledAmarilloOn ? 80 : 0, 0);
+    }
   }
 }
 
 void gestionarBuzzer() {
-  if (pantallaActual != MEDIR || estadoAlerta != CRITICO) {
-    digitalWrite(PIN_BUZZER, LOW); contadorBuzzer = 0; return;
-  }
-  contadorBuzzer++;
-  if (contadorBuzzer <= 10) digitalWrite(PIN_BUZZER, HIGH); // 20% Duty
+  if (pantallaActual != MEDIR || estadoAlerta != CRITICO) { digitalWrite(PIN_BUZZER, LOW); return; }
+  if (++contadorBuzzer <= 10) digitalWrite(PIN_BUZZER, HIGH);
   else digitalWrite(PIN_BUZZER, LOW);
-  if (contadorBuzzer >= 50) contadorBuzzer = 0; // Ciclo 2.5s
+  if (contadorBuzzer >= 50) contadorBuzzer = 0;
 }
 
 void ponerColorRGB(uint8_t r, uint8_t g, uint8_t b) {
   pixel.setPixelColor(0, pixel.Color(r, g, b)); pixel.show();
 }
 
-void manejarBoton1() {
-  if (pantallaActual == MENU_PRINCIPAL) pantallaActual = MEDIR;
-}
-
-void manejarBoton2() {
-  if (pantallaActual == MENU_PRINCIPAL) { 
-    pantallaActual = VER_REGISTROS; 
-    oled.clearDisplay(); oled.setCursor(0,0);
-    oled.println("Modo Registros"); oled.println("(No implementado)"); oled.display();
-  }
-}
-
-void manejarBoton3() {
-  pantallaActual = MENU_PRINCIPAL; 
-  digitalWrite(PIN_BUZZER, LOW); 
-  dibujarMenuPrincipal();
-}
+void manejarBoton1() { if (pantallaActual == MENU_PRINCIPAL) pantallaActual = MEDIR; }
+void manejarBoton2() { if (pantallaActual == MENU_PRINCIPAL) pantallaActual = VER_REGISTROS; }
+void manejarBoton3() { pantallaActual = MENU_PRINCIPAL; dibujarMenuPrincipal(); }
 
 void imprimirV10(int16_t v) {
-  if (v < 0) { oled.print('-'); v = -v; }
+  if (v < 0) { oled.print(''); v = v; }
   oled.print(v / 10); oled.print('.'); oled.print(v % 10);
 }
 
