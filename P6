@@ -212,7 +212,7 @@ void calcularVariables() {
 
 // --- FLUJO DE AIRE (LPM * 100) ---
   int32_t adc3 = (adc3_raw > 2932) ? 2932 : adc3_raw;
-  flujo_x100 = (int16_t)(adc3 * 9500L / 2322);
+  flujo_x100 = (int16_t)(adc3 * 9500L / 2321);
   if (flujo_x100 < 2000) flujo_x100 = 2000;  // clamp minimo 20.00 LPM
 }
 
