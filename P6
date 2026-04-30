@@ -188,12 +188,16 @@ void calcularVariables() {
   // Seg1: ADC 0-1056  -> -10.0 a -2.0 cmH2O  (sens 110 mV/cmH2O)
   // Seg2: ADC 1056-.. -> -2.0 a  35.0 cmH2O  (sens 32.25 mV/cmH2O)
   int32_t p_x10;
-  if (adc1_raw <= 1056)
-    p_x10 = ((int32_t)adc1_raw * 10 - 13200) / 132;
-  else
-    p_x10 = ((int32_t)adc1_raw * 370 - 422260) / 1577;
-  if (p_x10 >  350) p_x10 =  350;
-  if (p_x10 < -100) p_x10 = -100;
+  if (adc1_raw <= 880) {
+      p_x10 = -100;                                              // clamp -10.0 cmH2O
+  } else if (adc1_raw <= 1204) {
+      p_x10 = ((int32_t)(adc1_raw - 880) * 4L / 581) * 10 - 100; // Seg1: -10 a -2
+  } else if (adc1_raw <= 1247) {
+      p_x10 = ((int32_t)(adc1_raw - 1247) * 2L / 85) * 10;       // Seg2: -2 a 0
+  } else {
+      p_x10 = ((int32_t)(adc1_raw - 1247) * 5L / 213) * 10;      // Seg3: 0 a 35
+      if (p_x10 > 350) p_x10 = 350;                              // clamp 35.0 cmH2O
+  }
 
   presionEsMmHg = (digitalRead(PIN_SW2) == LOW);  // SW2=0 -> mmHg
   if (presionEsMmHg)
@@ -201,15 +205,15 @@ void calcularVariables() {
   else
     presion_x10 = (int16_t)p_x10;
 
-  // --- O2 (% * 100) ---
-  // Sens: 22.2 mV/%, 0V = 0%; 100% -> 2220 mV -> ADC ~2755
-  int32_t adc2 = (adc2_raw > 2755) ? 2755 : adc2_raw;
-  o2_x100 = (int16_t)((adc2 * 10000L) / 2755);
+// --- O2 (% * 100) ---
+  // Sens: 22.2 mV/%, 0V = 0%; 100% -> 2220 mV -> ADC ~2932
+  int32_t adc2 = (adc2_raw > 2932) ? 2932 : adc2_raw;
+  o2_x100 = (int16_t)((adc2 * 10000L) / 2932);
 
-  // --- FLUJO DE AIRE (LPM * 100) ---
-  // Sens: 18.5 mV/LPM, 0V = 0 LPM; 120 LPM -> 2220 mV -> ADC ~2755
-  int32_t adc3 = (adc3_raw > 2755) ? 2755 : adc3_raw;
-  flujo_x100 = (int16_t)((adc3 * 12000L) / 2755);
+// --- FLUJO DE AIRE (LPM * 100) ---
+  int32_t adc3 = (adc3_raw > 2932) ? 2932 : adc3_raw;
+  flujo_x100 = (int16_t)(adc3 * 9500L / 2322);
+  if (flujo_x100 < 2000) flujo_x100 = 2000;  // clamp minimo 20.00 LPM
 }
 
 // ---------- EVALUACION DE ALERTAS ----------
@@ -472,4 +476,3 @@ void dibujarDetalleRegistro() {
   bool negativo = (r->presion_x10 < 0) || (r->o2_x100 < 0) || (r->flujo_x100 < 0);
   digitalWrite(PIN_LED, negativo ? HIGH : LOW);
 }
-
