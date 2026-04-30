@@ -1,4 +1,4 @@
-
+//https://openneuro.org/datasets/ds005366/versions/2.0.0
 #include <Wire.h>               // Biblioteca I2C (para comunicar con la OLED)
 #include <Adafruit_GFX.h>       // Biblioteca de gráficos base para la OLED
 #include <Adafruit_SSD1306.h>   // Driver específico del controlador SSD1306 de la OLED
