@@ -191,11 +191,11 @@ void calcularVariables() {
   if (adc1_raw <= 880) {
       p_x10 = 100;                                              // -10.0 cmH2O
   } else if (adc1_raw <= 1204) {
-      p_x10 = ((int32_t)(adc1_raw  880) * 4L / 581) * 10  100; // Seg1: -10 a -2
+      p_x10 = ((int32_t)(adc1_raw - 880) * 4L / 581) * 10  100; // Seg1: -10 a -2
   } else if (adc1_raw <= 1247) {
-      p_x10 = ((int32_t)(adc1_raw  1247) * 2L / 85) * 10;       // Seg2: -2 a 0
+      p_x10 = ((int32_t)(adc1_raw - 1247) * 2L / 85) * 10;       // Seg2: -2 a 0
   } else {
-      p_x10 = ((int32_t)(adc1_raw  1247) * 5L / 213) * 10;      // Seg3: 0 a 35
+      p_x10 = ((int32_t)(adc1_raw - 1247) * 5L / 213) * 10;      // Seg3: 0 a 35
       if (p_x10 > 350) p_x10 = 350;                              //  35.0 cmH2O
   }
 
