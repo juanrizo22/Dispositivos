@@ -30,9 +30,9 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // --- MCPWM ---
 // 819200 Hz × 16384 ticks = 50 Hz exactos (equivalente a 14-bit)
-// compareValue = 228 + (ángulo × 1920) / 180
+// compareValue = 408 + (ángulo × 1740) / 180
 #define PWM_PERIOD   16384
-const uint32_t CMP_MIN = 228;
+const uint32_t CMP_MIN = 408;
 const uint32_t CMP_MAX = 2148;
 
 static mcpwm_cmpr_handle_t servoComparator = NULL;
@@ -123,8 +123,7 @@ void initServo() {
   mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
 }
 void moverServo(uint32_t ang) {
-  // compareValue = 228 + (ángulo × 1920) / 180
-  uint32_t cmp = CMP_MIN + (ang * 1920UL) / 180;
+  uint32_t cmp = CMP_MIN + (ang * (CMP_MAX - CMP_MIN)) / 180;
   mcpwm_comparator_set_compare_value(servoComparator, cmp);
 }
 
@@ -283,7 +282,7 @@ void loop() {
           ticksTemp = 300;
           estadoActual = EST_MODO_B_ERROR;
         } else {
-          uint32_t cmp = CMP_MIN + (1920UL * anguloObj) / 180;
+          uint32_t cmp = CMP_MIN + ((CMP_MAX - CMP_MIN) * anguloObj) / 180;
           durezaX100   = (cmp * 10000UL) / (PWM_PERIOD - 1);
           duracionMs   = (anguloObj * 4000UL) / 180;
           ticksMov = 1;
@@ -303,6 +302,8 @@ void loop() {
         ticksMov = 1;
         estadoActual = EST_MODO_B_RETORNO;
       } else if (anguloAct >= anguloObj) {
+        moverServo(0);
+        anguloAct = 0;
         ticksTemp = 1500;
         estadoActual = EST_MENU;
       }
