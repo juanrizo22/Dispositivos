@@ -45,7 +45,7 @@ enum Estado {
 Estado estadoActual = EST_LOGIN;
 
 // --- VARIABLES ---
-const char* passwords[] = {"1204", "2206", "1011"};
+const char* passwords[] = {"1204", "2206", "1110"};
 const char* nombres[]   = {"RUBEN", "JUAN", "MANU"};
 char passIngresada[5]   = "****";
 int posCursor = 0;
@@ -59,6 +59,7 @@ uint32_t durezaX100  = 0;   // duty × 100 para mostrar 2 decimales
 uint32_t duracionMs  = 0;
 uint32_t anguloRetorno = 0;
 bool btn1LastState = HIGH;
+bool retornoParaEjecutar = false;
 
 volatile uint32_t ticksTemp = 0;
 volatile uint32_t ticksMov  = 0;
@@ -152,12 +153,12 @@ void mostrarModoB(bool error) {
   } else {
     char buf[22];
     oled.setCursor(0, 16);
-    sprintf(buf, "ANGULO: %d", (int)anguloObj);   oled.println(buf);
+    sprintf(buf, "ANGULO: %d\xF8", (int)anguloObj);   oled.println(buf);
     oled.setCursor(0, 32);
     sprintf(buf, "DUREZA: %u.%02u%%", (unsigned)(durezaX100/100), (unsigned)(durezaX100%100));
     oled.println(buf);
     oled.setCursor(0, 48);
-    sprintf(buf, "DURACION: %dms", (int)duracionMs); oled.println(buf);
+    sprintf(buf, "DURACION: %.1fs", duracionMs / 1000.0f); oled.println(buf);
   }
   oled.display();
 }
@@ -284,10 +285,16 @@ void loop() {
         } else {
           uint32_t cmp = CMP_MIN + ((CMP_MAX - CMP_MIN) * anguloObj) / 180;
           durezaX100   = (cmp * 10000UL) / (PWM_PERIOD - 1);
-          duracionMs   = (anguloObj * 4000UL) / 180;
-          ticksMov = 1;
-          anguloAct = 0;
-          estadoActual = EST_MODO_B_EJECUTANDO;
+          duracionMs   = anguloObj * 50UL;
+          if (anguloAct > 0) {
+            anguloRetorno = anguloAct;
+            ticksMov = 1;
+            retornoParaEjecutar = true;
+            estadoActual = EST_MODO_B_RETORNO;
+          } else {
+            ticksMov = 1;
+            estadoActual = EST_MODO_B_EJECUTANDO;
+          }
         }
       }
       break;
@@ -302,10 +309,9 @@ void loop() {
         ticksMov = 1;
         estadoActual = EST_MODO_B_RETORNO;
       } else if (anguloAct >= anguloObj) {
-        moverServo(0);
-        anguloAct = 0;
-        ticksTemp = 1500;
-        estadoActual = EST_MENU;
+        strcpy(anguloStr, "000");
+        posAng = 0;
+        estadoActual = EST_MODO_B_INGRESO;
       }
       break;
 
@@ -325,9 +331,15 @@ void loop() {
       if (elapsed >= anguloRetorno) {
         anguloAct = 0;
         moverServo(0);
-        strcpy(anguloStr, "000");
-        posAng = 0;
-        estadoActual = EST_MODO_B_INGRESO;
+        if (retornoParaEjecutar) {
+          retornoParaEjecutar = false;
+          ticksMov = 1;
+          estadoActual = EST_MODO_B_EJECUTANDO;
+        } else {
+          strcpy(anguloStr, "000");
+          posAng = 0;
+          estadoActual = EST_MODO_B_INGRESO;
+        }
       } else {
         anguloAct = anguloRetorno - elapsed;
         moverServo(anguloAct);
