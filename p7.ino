@@ -4,7 +4,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Keypad.h>
 #include <Adafruit_NeoPixel.h>
-#include "driver/mcpwm_prelude.h"
+#include "driver/mcpwm_prelude.h"   // ← MCPWM en lugar de ledc.h
 
 // --- PINES ---
 #define SDA_PIN      2
@@ -29,42 +29,37 @@ byte colPins[COLS] = {17, 18, 8, 9};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // --- MCPWM ---
+// 819200 Hz × 16384 ticks = 50 Hz exactos (equivalente a 14-bit)
+// compareValue = 228 + (ángulo × 1920) / 180
 #define PWM_PERIOD   16384
 const uint32_t CMP_MIN = 228;
 const uint32_t CMP_MAX = 2148;
+
 static mcpwm_cmpr_handle_t servoComparator = NULL;
 
 // --- ESTADOS ---
 enum Estado {
   EST_LOGIN, EST_BLOQUEADO, EST_BIENVENIDA, EST_ERROR_PASS,
-  EST_MENU,
-  EST_MODO_B_INGRESO,
-  EST_MODO_B_CONFIRMAR,
-  EST_MODO_B_EJECUTANDO,
-  EST_MODO_B_ESPERA,
-  EST_MODO_B_ERROR
+  EST_MENU, EST_MODO_B_INGRESO, EST_MODO_B_EJECUTANDO, EST_MODO_B_ERROR, EST_MODO_B_RETORNO
 };
-Estado estadoActual  = EST_LOGIN;
-Estado estadoRetorno = EST_MODO_B_INGRESO;
+Estado estadoActual = EST_LOGIN;
 
-// --- VARIABLES DE LOGIN ---
+// --- VARIABLES ---
 const char* passwords[] = {"1204", "2206", "1011"};
 const char* nombres[]   = {"RUBEN", "JUAN", "MANU"};
 char passIngresada[5]   = "****";
 int posCursor = 0;
 int intentos  = 0;
 
-// --- VARIABLES MODO B ---
-// Ingreso de ángulo como entero acumulado (D borra, * avanza cursor no aplica)
-int anguloIngresado = 0;   // valor numérico acumulado durante ingreso
-int digitCount      = 0;   // cantidad de dígitos ingresados (max 3)
+char anguloStr[4] = "000";
+int posAng = 0;
+uint32_t anguloObj = 0;
+uint32_t anguloAct = 0;
+uint32_t durezaX100  = 0;   // duty × 100 para mostrar 2 decimales
+uint32_t duracionMs  = 0;
+uint32_t anguloRetorno = 0;
+bool btn1LastState = HIGH;
 
-uint32_t anguloObj  = 0;
-uint32_t anguloAct  = 0;
-uint32_t durezaObj  = 0;   // calculada: (anguloObj * 100) / 180
-uint32_t duracionObj = 0;  // calculada: (anguloObj * 4000) / 180  [ms → ticks /10]
-
-// --- TIMERS ---
 volatile uint32_t ticksTemp = 0;
 volatile uint32_t ticksMov  = 0;
 volatile uint32_t ticksBtn2 = 0;
@@ -78,12 +73,11 @@ void IRAM_ATTR onTimer() {
   else if (ticksBtn2 < 400)         ticksBtn2 = 0;
 }
 
-// --- UTILIDADES ---
+// --- FUNCIONES ---
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   pixel.setPixelColor(0, pixel.Color(r, g, b));
   pixel.show();
 }
-
 void initServo() {
   mcpwm_timer_handle_t timer = NULL;
 
@@ -91,7 +85,7 @@ void initServo() {
   memset(&timer_cfg, 0, sizeof(timer_cfg));
   timer_cfg.group_id      = 0;
   timer_cfg.clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT;
-  timer_cfg.resolution_hz = 819200;
+  timer_cfg.resolution_hz = 819200;          // 50 Hz × 16384 ticks
   timer_cfg.count_mode    = MCPWM_TIMER_COUNT_MODE_UP;
   timer_cfg.period_ticks  = PWM_PERIOD;
   mcpwm_new_timer(&timer_cfg, &timer);
@@ -128,13 +122,12 @@ void initServo() {
   mcpwm_timer_enable(timer);
   mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
 }
-
 void moverServo(uint32_t ang) {
+  // compareValue = 228 + (ángulo × 1920) / 180
   uint32_t cmp = CMP_MIN + (ang * 1920UL) / 180;
   mcpwm_comparator_set_compare_value(servoComparator, cmp);
 }
 
-// --- PANTALLAS ---
 void resetLogin() {
   strcpy(passIngresada, "****");
   posCursor = 0;
@@ -144,11 +137,33 @@ void resetLogin() {
 
 void actualizarPantalla(const char* t1, const char* t2) {
   oled.clearDisplay();
-  oled.setTextSize(1); oled.setCursor(0,  0); oled.println(t1);
+  oled.setTextSize(1); oled.setCursor(0, 0);  oled.println(t1);
   oled.setTextSize(2); oled.setCursor(30, 30); oled.println(t2);
   oled.display();
 }
 
+void mostrarModoB(bool error) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setCursor(0,  0); oled.println("MODO PROGRAMADO");
+  if (error) {
+    oled.setCursor(0, 16); oled.println("ANGULO: ERROR");
+    oled.setCursor(0, 32); oled.println("DUREZA: - - -");
+    oled.setCursor(0, 48); oled.println("DURACION: - - -");
+  } else {
+    char buf[22];
+    oled.setCursor(0, 16);
+    sprintf(buf, "ANGULO: %d", (int)anguloObj);   oled.println(buf);
+    oled.setCursor(0, 32);
+    sprintf(buf, "DUREZA: %u.%02u%%", (unsigned)(durezaX100/100), (unsigned)(durezaX100%100));
+    oled.println(buf);
+    oled.setCursor(0, 48);
+    sprintf(buf, "DURACION: %dms", (int)duracionMs); oled.println(buf);
+  }
+  oled.display();
+}
+
+// Menú en 2 líneas para que quepa en la OLED (textSize 2 desbordaba)
 void mostrarMenu() {
   oled.clearDisplay();
   oled.setTextSize(1);
@@ -158,36 +173,6 @@ void mostrarMenu() {
   oled.display();
 }
 
-// Pantalla de confirmación: muestra los 3 parámetros calculados
-void mostrarConfirmacion(bool error) {
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);  oled.println("MODO PROGRAMADO");
-
-  if (error) {
-    oled.setCursor(0, 16); oled.println("ANGULO: ERROR");
-    oled.setCursor(0, 28); oled.println("DUREZA: - - -");
-    oled.setCursor(0, 40); oled.println("DURACION: - - -");
-  } else {
-    char buf[22];
-    sprintf(buf, "ANGULO: %d grados", (int)anguloObj);
-    oled.setCursor(0, 16); oled.println(buf);
-    sprintf(buf, "DUREZA: %d %%", (int)durezaObj);
-    oled.setCursor(0, 28); oled.println(buf);
-    sprintf(buf, "DURACION: %d ms", (int)duracionObj);
-    oled.setCursor(0, 40); oled.println(buf);
-    oled.setCursor(0, 52); oled.println("BTN1: INICIAR");
-  }
-  oled.display();
-}
-
-void resetModoB() {
-  anguloIngresado = 0;
-  digitCount      = 0;
-  estadoActual    = EST_MODO_B_INGRESO;
-}
-
-// --- SETUP ---
 void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -199,16 +184,17 @@ void setup() {
 
   timerHw = timerBegin(1000000);
   timerAttachInterrupt(timerHw, &onTimer);
-  timerAlarm(timerHw, 10000, true, 0); // tick cada 10 ms
+  timerAlarm(timerHw, 10000, true, 0); // Tick cada 10 ms
 
   resetLogin();
 }
 
-// --- LOOP PRINCIPAL ---
 void loop() {
   char key = keypad.getKey();
+  bool btn1State   = digitalRead(BTN1_PIN);
+  bool btn1Pressed = (btn1State == LOW && btn1LastState == HIGH);
+  btn1LastState = btn1State;
 
-  // BTN2 largo → logout inmediato desde cualquier estado
   if (estadoActual != EST_LOGIN && ticksBtn2 >= 400) {
     ticksBtn2 = 0;
     moverServo(0);
@@ -218,7 +204,6 @@ void loop() {
 
   switch (estadoActual) {
 
-    // ── LOGIN ─────────────────────────────────────────────────────────────────
     case EST_LOGIN:
       actualizarPantalla("INGRESE CLAVE", passIngresada);
       if (key) {
@@ -231,7 +216,7 @@ void loop() {
         } else if (key == '#') {
           if (strchr(passIngresada, '*') == NULL) {
             int userIdx = -1;
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 3; i++)          // ← corregido: era i<2
               if (strcmp(passIngresada, passwords[i]) == 0) userIdx = i;
 
             if (userIdx != -1) {
@@ -261,108 +246,95 @@ void loop() {
     case EST_BIENVENIDA:
     case EST_ERROR_PASS:
       if (ticksTemp == 0) {
-        if (estadoActual == EST_BIENVENIDA) estadoActual = EST_MENU;
+        if (estadoActual == EST_BIENVENIDA) { ticksTemp = 1500; estadoActual = EST_MENU; }
         else resetLogin();
       }
       break;
 
-    // ── MENÚ ──────────────────────────────────────────────────────────────────
     case EST_MENU:
       setRGB(0, 255, 0);
       mostrarMenu();
-      if (key == 'B') resetModoB();
+      if (key) ticksTemp = 1500;
+      if (key == 'B') {
+        strcpy(anguloStr, "000");
+        posAng = 0;
+        estadoActual = EST_MODO_B_INGRESO;
+      }
+      if (ticksTemp == 0) resetLogin();
       break;
 
-    // ── INGRESO ÁNGULO ─────────────────────────────────────────────────────────
-    case EST_MODO_B_INGRESO: {
-      // Muestra el valor acumulado mientras se escribe
-      char buf[5];
-      if (digitCount == 0)
-        sprintf(buf, "___");          // todavía no se ingresó nada
-      else
-        sprintf(buf, "%d", anguloIngresado);
-
-      actualizarPantalla("ANGULO (0-180)", buf);
-
+    case EST_MODO_B_INGRESO:
+      actualizarPantalla("MODO PROGRAMADO", anguloStr);
       if (key) {
         if (key >= '0' && key <= '9') {
-          if (digitCount < 3) {            // máximo 3 dígitos (0-999, validamos en #)
-            int digito = key - '0';        // convierte char '5' → int 5
-            anguloIngresado = anguloIngresado * 10 + digito;
-            digitCount++;
-          }
+          int digit = key - '0';
+          anguloStr[posAng] = '0' + digit;
+        } else if (key == '*') {
+          if (posAng < 2) posAng++;
         } else if (key == 'D') {
-          // D borra todo el valor ingresado
-          anguloIngresado = 0;
-          digitCount      = 0;
-        } else if (key == '#') {
-          // Confirmar con BTN1 o '#': validar y calcular
-          anguloObj = (uint32_t)anguloIngresado;
-          if (anguloObj > 180) {
-            // Muestra error en formato solicitado y vuelve a ingresar
-            mostrarConfirmacion(true);
-            ticksTemp    = 300;
-            estadoRetorno = EST_MODO_B_INGRESO;
-            estadoActual  = EST_MODO_B_ERROR;
-          } else {
-            // Calcula dureza y duración a partir del ángulo
-            durezaObj   = (anguloObj * 100UL) / 180;          // %
-            duracionObj = (anguloObj * 4000UL) / 180;         // ms
-            estadoActual = EST_MODO_B_CONFIRMAR;
-          }
+          if (posAng > 0) { posAng--; anguloStr[posAng] = '0'; }
+          else              anguloStr[0] = '0';
+        }
+      }
+      if (btn1Pressed) {
+        anguloObj = atoi(anguloStr);
+        if (anguloObj > 180) {
+          setRGB(255, 0, 0);
+          ticksTemp = 300;
+          estadoActual = EST_MODO_B_ERROR;
+        } else {
+          uint32_t cmp = CMP_MIN + (1920UL * anguloObj) / 180;
+          durezaX100   = (cmp * 10000UL) / (PWM_PERIOD - 1);
+          duracionMs   = (anguloObj * 4000UL) / 180;
+          ticksMov = 1;
+          anguloAct = 0;
+          estadoActual = EST_MODO_B_EJECUTANDO;
         }
       }
       break;
-    }
 
-    // ── CONFIRMACIÓN ──────────────────────────────────────────────────────────
-    case EST_MODO_B_CONFIRMAR:
-      mostrarConfirmacion(false);
-      if (digitalRead(BTN1_PIN) == LOW) {
-        ticksMov  = 1;
-        anguloAct = 0;
-        estadoActual = EST_MODO_B_EJECUTANDO;
-      }
-      break;
-
-    // ── EJECUTANDO ────────────────────────────────────────────────────────────
-    case EST_MODO_B_EJECUTANDO: {
-      uint32_t vel = (durezaObj == 0) ? 1 : durezaObj;
-      // dureza 100 → 1 grado cada 50 ms; dureza 50 → 1 grado cada 100 ms
-      anguloAct = (ticksMov * vel) / 500;
+    case EST_MODO_B_EJECUTANDO:
+      anguloAct = ticksMov / 5;
       if (anguloAct > anguloObj) anguloAct = anguloObj;
       moverServo(anguloAct);
-
-      char buf[12];
-      sprintf(buf, "%d deg", (int)anguloAct);
-      actualizarPantalla("EJECUTANDO...", buf);
-
-      if (anguloAct >= anguloObj) {
-        ticksMov  = 0;
-        // duracionObj está en ms → convertir a ticks de 10 ms
-        ticksTemp = duracionObj / 10;
-        estadoActual = EST_MODO_B_ESPERA;
+      mostrarModoB(false);
+      if (key == 'D') {
+        anguloRetorno = anguloAct;
+        ticksMov = 1;
+        estadoActual = EST_MODO_B_RETORNO;
+      } else if (anguloAct >= anguloObj) {
+        ticksTemp = 1500;
+        estadoActual = EST_MENU;
       }
       break;
-    }
 
-    // ── ESPERA ────────────────────────────────────────────────────────────────
-    case EST_MODO_B_ESPERA: {
-      char buf[12];
-      sprintf(buf, "%d deg", (int)anguloObj);
-      actualizarPantalla("MANTENIENDO", buf);
-      if (ticksTemp == 0) estadoActual = EST_MENU;
-      break;
-    }
-
-    // ── ERROR MODO B ──────────────────────────────────────────────────────────
     case EST_MODO_B_ERROR:
-      if (ticksTemp == 0) {
-        anguloIngresado = 0;   // limpia para re-ingreso
-        digitCount      = 0;
-        estadoActual    = estadoRetorno;
+      mostrarModoB(true);
+      if (key == 'D') {
+        anguloRetorno = anguloAct;
+        ticksMov = 1;
+        estadoActual = EST_MODO_B_RETORNO;
+      } else if (ticksTemp == 0) {
+        estadoActual = EST_MODO_B_INGRESO;
       }
       break;
+
+    case EST_MODO_B_RETORNO: {
+      uint32_t elapsed = ticksMov / 5;
+      if (elapsed >= anguloRetorno) {
+        anguloAct = 0;
+        moverServo(0);
+        strcpy(anguloStr, "000");
+        posAng = 0;
+        estadoActual = EST_MODO_B_INGRESO;
+      } else {
+        anguloAct = anguloRetorno - elapsed;
+        moverServo(anguloAct);
+        char rbuf[12];
+        sprintf(rbuf, "%d deg", (int)anguloAct);
+        actualizarPantalla("RETORNANDO...", rbuf);
+      }
+      break;
+    }
   }
 }
-
