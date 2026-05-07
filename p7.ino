@@ -29,12 +29,9 @@ byte colPins[COLS] = {17, 18, 8, 9};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // --- MCPWM ---
-// 819200 Hz × 16384 ticks = 50 Hz exactos (equivalente a 14-bit)
-// compareValue = 228 + (ángulo × 1920) / 180
 #define PWM_PERIOD   16384
 const uint32_t CMP_MIN = 228;
 const uint32_t CMP_MAX = 2148;
-
 static mcpwm_cmpr_handle_t servoComparator = NULL;
 
 // --- ESTADOS ---
@@ -42,8 +39,6 @@ enum Estado {
   EST_LOGIN, EST_BLOQUEADO, EST_BIENVENIDA, EST_ERROR_PASS,
   EST_MENU,
   EST_MODO_B_INGRESO,
-  EST_MODO_B_DUREZA,
-  EST_MODO_B_DURACION,
   EST_MODO_B_CONFIRMAR,
   EST_MODO_B_EJECUTANDO,
   EST_MODO_B_ESPERA,
@@ -59,19 +54,15 @@ char passIngresada[5]   = "****";
 int posCursor = 0;
 int intentos  = 0;
 
-// --- VARIABLES MODO B (dígitos como int para usar key-'0') ---
-int anguloDig[3]    = {0, 0, 0};
-int posAng          = 0;
+// --- VARIABLES MODO B ---
+// Ingreso de ángulo como entero acumulado (D borra, * avanza cursor no aplica)
+int anguloIngresado = 0;   // valor numérico acumulado durante ingreso
+int digitCount      = 0;   // cantidad de dígitos ingresados (max 3)
+
 uint32_t anguloObj  = 0;
 uint32_t anguloAct  = 0;
-
-int durezaDig[3]    = {0, 0, 0};
-int posDureza       = 0;
-uint32_t durezaObj  = 0;
-
-int duracionDig[3]     = {0, 0, 0};
-int posDuracion        = 0;
-uint32_t duracionObj   = 0;
+uint32_t durezaObj  = 0;   // calculada: (anguloObj * 100) / 180
+uint32_t duracionObj = 0;  // calculada: (anguloObj * 4000) / 180  [ms → ticks /10]
 
 // --- TIMERS ---
 volatile uint32_t ticksTemp = 0;
@@ -91,10 +82,6 @@ void IRAM_ATTR onTimer() {
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   pixel.setPixelColor(0, pixel.Color(r, g, b));
   pixel.show();
-}
-
-int digsToNum(int* digs) {
-  return digs[0] * 100 + digs[1] * 10 + digs[2];
 }
 
 void initServo() {
@@ -157,7 +144,7 @@ void resetLogin() {
 
 void actualizarPantalla(const char* t1, const char* t2) {
   oled.clearDisplay();
-  oled.setTextSize(1); oled.setCursor(0,  0);  oled.println(t1);
+  oled.setTextSize(1); oled.setCursor(0,  0); oled.println(t1);
   oled.setTextSize(2); oled.setCursor(30, 30); oled.println(t2);
   oled.display();
 }
@@ -171,26 +158,33 @@ void mostrarMenu() {
   oled.display();
 }
 
-// Muestra ángulo, dureza y duración en líneas separadas antes de ejecutar
-void mostrarParametros() {
-  char buf[22];
+// Pantalla de confirmación: muestra los 3 parámetros calculados
+void mostrarConfirmacion(bool error) {
   oled.clearDisplay();
   oled.setTextSize(1);
-  sprintf(buf, "Angulo:  %3d grados", (int)anguloObj);
-  oled.setCursor(0,  0); oled.println(buf);
-  sprintf(buf, "Dureza:  %3d %%", (int)durezaObj);
-  oled.setCursor(0, 16); oled.println(buf);
-  sprintf(buf, "Duracion:%3d seg", (int)duracionObj);
-  oled.setCursor(0, 32); oled.println(buf);
-  oled.setCursor(0, 50); oled.println("BTN1: INICIAR");
+  oled.setCursor(0, 0);  oled.println("MODO PROGRAMADO");
+
+  if (error) {
+    oled.setCursor(0, 16); oled.println("ANGULO: ERROR");
+    oled.setCursor(0, 28); oled.println("DUREZA: - - -");
+    oled.setCursor(0, 40); oled.println("DURACION: - - -");
+  } else {
+    char buf[22];
+    sprintf(buf, "ANGULO: %d grados", (int)anguloObj);
+    oled.setCursor(0, 16); oled.println(buf);
+    sprintf(buf, "DUREZA: %d %%", (int)durezaObj);
+    oled.setCursor(0, 28); oled.println(buf);
+    sprintf(buf, "DURACION: %d ms", (int)duracionObj);
+    oled.setCursor(0, 40); oled.println(buf);
+    oled.setCursor(0, 52); oled.println("BTN1: INICIAR");
+  }
   oled.display();
 }
 
 void resetModoB() {
-  memset(anguloDig,   0, sizeof(anguloDig));   posAng      = 0;
-  memset(durezaDig,   0, sizeof(durezaDig));   posDureza   = 0;
-  memset(duracionDig, 0, sizeof(duracionDig)); posDuracion = 0;
-  estadoActual = EST_MODO_B_INGRESO;
+  anguloIngresado = 0;
+  digitCount      = 0;
+  estadoActual    = EST_MODO_B_INGRESO;
 }
 
 // --- SETUP ---
@@ -224,12 +218,12 @@ void loop() {
 
   switch (estadoActual) {
 
-    // ── LOGIN ────────────────────────────────────────────────────────────────
+    // ── LOGIN ─────────────────────────────────────────────────────────────────
     case EST_LOGIN:
       actualizarPantalla("INGRESE CLAVE", passIngresada);
       if (key) {
         if (key >= '0' && key <= '9') {
-          passIngresada[posCursor] = key;       // guarda el char directamente
+          passIngresada[posCursor] = key;
         } else if (key == '*') {
           if (posCursor < 3) posCursor++;
         } else if (key == 'D') {
@@ -272,106 +266,66 @@ void loop() {
       }
       break;
 
-    // ── MENÚ ─────────────────────────────────────────────────────────────────
+    // ── MENÚ ──────────────────────────────────────────────────────────────────
     case EST_MENU:
       setRGB(0, 255, 0);
       mostrarMenu();
       if (key == 'B') resetModoB();
       break;
 
-    // ── INGRESO ÁNGULO ────────────────────────────────────────────────────────
+    // ── INGRESO ÁNGULO ─────────────────────────────────────────────────────────
     case EST_MODO_B_INGRESO: {
-      char buf[4];
-      sprintf(buf, "%d%d%d", anguloDig[0], anguloDig[1], anguloDig[2]);
+      // Muestra el valor acumulado mientras se escribe
+      char buf[5];
+      if (digitCount == 0)
+        sprintf(buf, "___");          // todavía no se ingresó nada
+      else
+        sprintf(buf, "%d", anguloIngresado);
+
       actualizarPantalla("ANGULO (0-180)", buf);
+
       if (key) {
         if (key >= '0' && key <= '9') {
-          int numero = key - '0';          // convierte '1' → 1
-          anguloDig[posAng] = numero;
-        } else if (key == '*') {
-          if (posAng < 2) posAng++;
-        } else if (key == 'D') {          // D borra todo el valor ingresado
-          memset(anguloDig, 0, sizeof(anguloDig));
-          posAng = 0;
+          if (digitCount < 3) {            // máximo 3 dígitos (0-999, validamos en #)
+            int digito = key - '0';        // convierte char '5' → int 5
+            anguloIngresado = anguloIngresado * 10 + digito;
+            digitCount++;
+          }
+        } else if (key == 'D') {
+          // D borra todo el valor ingresado
+          anguloIngresado = 0;
+          digitCount      = 0;
         } else if (key == '#') {
-          anguloObj = digsToNum(anguloDig);
+          // Confirmar con BTN1 o '#': validar y calcular
+          anguloObj = (uint32_t)anguloIngresado;
           if (anguloObj > 180) {
-            setRGB(255, 0, 0);
-            actualizarPantalla("ANGULO", "ERROR");
-            ticksTemp = 300;
+            // Muestra error en formato solicitado y vuelve a ingresar
+            mostrarConfirmacion(true);
+            ticksTemp    = 300;
             estadoRetorno = EST_MODO_B_INGRESO;
             estadoActual  = EST_MODO_B_ERROR;
           } else {
-            estadoActual = EST_MODO_B_DUREZA;
+            // Calcula dureza y duración a partir del ángulo
+            durezaObj   = (anguloObj * 100UL) / 180;          // %
+            duracionObj = (anguloObj * 4000UL) / 180;         // ms
+            estadoActual = EST_MODO_B_CONFIRMAR;
           }
         }
       }
       break;
     }
 
-    // ── INGRESO DUREZA (0-100 %) ──────────────────────────────────────────────
-    case EST_MODO_B_DUREZA: {
-      char buf[4];
-      sprintf(buf, "%d%d%d", durezaDig[0], durezaDig[1], durezaDig[2]);
-      actualizarPantalla("DUREZA (0-100)", buf);
-      if (key) {
-        if (key >= '0' && key <= '9') {
-          int numero = key - '0';
-          durezaDig[posDureza] = numero;
-        } else if (key == '*') {
-          if (posDureza < 2) posDureza++;
-        } else if (key == 'D') {
-          memset(durezaDig, 0, sizeof(durezaDig));
-          posDureza = 0;
-        } else if (key == '#') {
-          durezaObj = digsToNum(durezaDig);
-          if (durezaObj > 100) {
-            setRGB(255, 0, 0);
-            actualizarPantalla("DUREZA", "ERROR");
-            ticksTemp = 300;
-            estadoRetorno = EST_MODO_B_DUREZA;
-            estadoActual  = EST_MODO_B_ERROR;
-          } else {
-            estadoActual = EST_MODO_B_DURACION;
-          }
-        }
-      }
-      break;
-    }
-
-    // ── INGRESO DURACIÓN (0-999 seg) ──────────────────────────────────────────
-    case EST_MODO_B_DURACION: {
-      char buf[4];
-      sprintf(buf, "%d%d%d", duracionDig[0], duracionDig[1], duracionDig[2]);
-      actualizarPantalla("DURACION (seg)", buf);
-      if (key) {
-        if (key >= '0' && key <= '9') {
-          int numero = key - '0';
-          duracionDig[posDuracion] = numero;
-        } else if (key == '*') {
-          if (posDuracion < 2) posDuracion++;
-        } else if (key == 'D') {
-          memset(duracionDig, 0, sizeof(duracionDig));
-          posDuracion = 0;
-        } else if (key == '#') {
-          duracionObj  = digsToNum(duracionDig);
-          estadoActual = EST_MODO_B_CONFIRMAR;
-        }
-      }
-      break;
-    }
-
-    // ── CONFIRMACIÓN: muestra ángulo, dureza y duración en líneas separadas ───
+    // ── CONFIRMACIÓN ──────────────────────────────────────────────────────────
     case EST_MODO_B_CONFIRMAR:
-      mostrarParametros();
+      mostrarConfirmacion(false);
       if (digitalRead(BTN1_PIN) == LOW) {
-        ticksMov = 1;
+        ticksMov  = 1;
         anguloAct = 0;
         estadoActual = EST_MODO_B_EJECUTANDO;
       }
       break;
 
-    // ── EJECUTANDO: mueve el servo según dureza (velocidad) ──────────────────
+    // ── EJECUTANDO ────────────────────────────────────────────────────────────
     case EST_MODO_B_EJECUTANDO: {
       uint32_t vel = (durezaObj == 0) ? 1 : durezaObj;
       // dureza 100 → 1 grado cada 50 ms; dureza 50 → 1 grado cada 100 ms
@@ -384,14 +338,15 @@ void loop() {
       actualizarPantalla("EJECUTANDO...", buf);
 
       if (anguloAct >= anguloObj) {
-        ticksMov  = 0;                        // detiene el contador de movimiento
-        ticksTemp = duracionObj * 100;        // duracion en ticks (×10 ms)
+        ticksMov  = 0;
+        // duracionObj está en ms → convertir a ticks de 10 ms
+        ticksTemp = duracionObj / 10;
         estadoActual = EST_MODO_B_ESPERA;
       }
       break;
     }
 
-    // ── ESPERA: mantiene posición por la duración configurada ─────────────────
+    // ── ESPERA ────────────────────────────────────────────────────────────────
     case EST_MODO_B_ESPERA: {
       char buf[12];
       sprintf(buf, "%d deg", (int)anguloObj);
@@ -400,9 +355,13 @@ void loop() {
       break;
     }
 
-    // ── ERROR MODO B ─────────────────────────────────────────────────────────
+    // ── ERROR MODO B ──────────────────────────────────────────────────────────
     case EST_MODO_B_ERROR:
-      if (ticksTemp == 0) estadoActual = estadoRetorno;
+      if (ticksTemp == 0) {
+        anguloIngresado = 0;   // limpia para re-ingreso
+        digitCount      = 0;
+        estadoActual    = estadoRetorno;
+      }
       break;
   }
 }
