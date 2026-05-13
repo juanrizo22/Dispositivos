@@ -1,9 +1,3 @@
-/*
- * PRÁCTICA #7 — Adelanto
- * Teclado Matricial, PWM con Servomotor, Input Capture y Timer
- * Universidad de Antioquia — Bioingeniería 2026-1
- */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -53,8 +47,14 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 // ─── MCPWM — SERVO SG90 ──────────────────────────────────────────────────
 #define SERVO_RES_HZ   1000000UL
 #define SERVO_PERIODO  20000UL
-#define SERVO_US_MIN     500UL
-#define SERVO_US_MAX    2400UL
+
+#define LEDC_RES_BITS      14UL
+#define LEDC_MAX_COMPARE   ((1UL << LEDC_RES_BITS) - 1UL)
+#define CMP_MIN            408UL
+#define CMP_MAX            2008UL
+
+#define SERVO_US_MIN       ((CMP_MIN * SERVO_PERIODO) / LEDC_MAX_COMPARE)
+#define SERVO_US_MAX       ((CMP_MAX * SERVO_PERIODO) / LEDC_MAX_COMPARE)
 
 static mcpwm_cmpr_handle_t servoCmp = NULL;
 
@@ -235,12 +235,12 @@ uint16_t leerAdcPromedio12() {
 }
 
 uint32_t adcAangulo(uint16_t adc) {
-  return ((uint32_t)adc * 180UL + 2047UL) / 4095UL;
+  return (uint32_t)adc * 180UL / 4095UL;
 }
 
 uint32_t duracionAangulo(uint64_t durUsBtn) {
   if (durUsBtn >= US_4S) return 180;
-  return (uint32_t)((durUsBtn * 180ULL + (US_4S / 2)) / US_4S);
+  return (uint32_t)(durUsBtn * 180ULL / US_4S);
 }
 
 const char* posicionBiomecanica(uint32_t ang) {
