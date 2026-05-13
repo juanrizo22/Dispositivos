@@ -13,12 +13,16 @@
 #include "driver/mcpwm_prelude.h"
 
 // ─── PINES ────────────────────────────────────────────────────────────────
-#define SDA_PIN   2
-#define SCL_PIN   1
-#define PIN_RGB  48
+#define SDA_PIN    2
+#define SCL_PIN    1
+#define PIN_RGB   48
 #define SERVO_PIN 13
 #define BTN1_PIN   4
 #define BTN2_PIN   5
+#define SW1_PIN   11
+#define SW2_PIN   12
+#define LED_PIN   46
+#define POT_PIN   10
 
 // ─── OLED ─────────────────────────────────────────────────────────────────
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
@@ -51,8 +55,6 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define SERVO_PERIODO  20000UL
 #define SERVO_US_MIN     500UL
 #define SERVO_US_MAX    2400UL
-uint32_t pasosMov = 0;
-
 
 static mcpwm_cmpr_handle_t servoCmp = NULL;
 
@@ -118,9 +120,6 @@ void initServo() {
 }
 
 // ─── TIMERS CON INTERRUPCIONES ───────────────────────────────────────────
-// Base 1 MHz: 1 tick = 1 us.
-// Cada ISR solo levanta una bandera.
-
 hw_timer_t *timerGral = NULL;
 hw_timer_t *timerMov  = NULL;
 hw_timer_t *timerBtn2 = NULL;
@@ -148,11 +147,9 @@ void IRAM_ATTR isrTimerBtn2() {
 
 bool tomarBandera(volatile bool &flag) {
   if (!flag) return false;
-
   noInterrupts();
   flag = false;
   interrupts();
-
   return true;
 }
 
@@ -182,14 +179,21 @@ enum Estado {
   EST_BLOQUEADO,
   EST_BIENVENIDA,
   EST_MENU,
+  EST_MODO_A,
   EST_MODO_B_INGRESO,
   EST_MODO_B_MOVIENDO,
   EST_MODO_B_LISTO,
   EST_MODO_B_ERROR
 };
 
+enum SubModoA {
+  MODO_A_POT,
+  MODO_A_BTN
+};
+
 Estado estadoActual = EST_LOGIN;
 Estado estadoAnterior = EST_MODO_B_ERROR;
+SubModoA subModoA = MODO_A_POT;
 
 // ─── VARIABLES ───────────────────────────────────────────────────────────
 char passIngresada[5] = "****";
@@ -204,10 +208,82 @@ uint32_t anguloObj = 0;
 uint32_t anguloAct = 0;
 uint32_t durezaX100 = 0;
 uint32_t durUs = 0;
+uint32_t pasosMov = 0;
+
+uint16_t adcProm = 0;
+uint16_t ticksAdc = 0;
+uint16_t ticksBlink = 0;
+bool ledBlinkOn = false;
 
 bool btn1Ant = HIGH;
 bool btn2Ant = HIGH;
 bool btn2Activo = false;
+
+bool btn1ActivoA = false;
+bool btn1LargoA = false;
+
+// ─── FUNCIONES MODO A ────────────────────────────────────────────────────
+uint16_t leerAdcPromedio12() {
+  uint32_t suma = 0;
+  for (int i = 0; i < 12; i++) {
+    suma += analogRead(POT_PIN);
+  }
+  return suma / 12;
+}
+
+uint32_t adcAangulo(uint16_t adc) {
+  return ((uint32_t)adc * 180UL + 2047UL) / 4095UL;
+}
+
+uint32_t duracionAangulo(uint64_t durUsBtn) {
+  if (durUsBtn >= US_4S) return 180;
+  return (uint32_t)((durUsBtn * 180ULL + (US_4S / 2)) / US_4S);
+}
+
+const char* posicionBiomecanica(uint32_t ang) {
+  if (ang <= 45) return "EXTENSION";
+  if (ang <= 95) return "FLEX PARCIAL";
+  if (ang <= 150) return "FLEX COMPLETA";
+  return "HIPERFLEXION";
+}
+
+void colorPorAngulo(uint32_t ang, uint8_t &r, uint8_t &g, uint8_t &b) {
+  if (ang <= 45) {
+    r = 0; g = 180; b = 180;
+  } else if (ang <= 95) {
+    r = 180; g = 0; b = 180;
+  } else if (ang <= 150) {
+    r = 255; g = 120; b = 0;
+  } else {
+    r = 255; g = 255; b = 255;
+  }
+}
+
+uint8_t medioPeriodoBlinkTicks(uint32_t ang) {
+  if (ang <= 45) return 30;     // 0.33 Hz aprox.
+  if (ang <= 95) return 15;     // 0.66 Hz aprox.
+  if (ang <= 150) return 10;    // 1 Hz
+  return 5;                     // 2 Hz
+}
+
+void actualizarParpadeoModoA() {
+  ticksBlink++;
+
+  if (ticksBlink >= medioPeriodoBlinkTicks(anguloAct)) {
+    ticksBlink = 0;
+    ledBlinkOn = !ledBlinkOn;
+
+    if (ledBlinkOn) {
+      uint8_t r, g, b;
+      colorPorAngulo(anguloAct, r, g, b);
+      setRGB(r, g, b);
+      digitalWrite(LED_PIN, HIGH);
+    } else {
+      setRGB(0, 0, 0);
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+}
 
 // ─── PANTALLAS ───────────────────────────────────────────────────────────
 void pantallaLogin() {
@@ -250,6 +326,43 @@ void pantallaMenu() {
   oled.display();
 }
 
+void pantallaModoA() {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 0);
+  if (subModoA == MODO_A_POT) oled.print("MODO A: POT");
+  else oled.print("MODO A: BTN1");
+
+  oled.setCursor(0, 13);
+  oled.print("ANGULO: ");
+  oled.print((int)anguloAct);
+  oled.print("\xF8");
+
+  oled.setCursor(0, 26);
+
+  if (subModoA == MODO_A_BTN || digitalRead(SW1_PIN) == HIGH) {
+    uint32_t durezaManual = calcDureza(anguloAus(anguloAct));
+    oled.print("DUREZA: ");
+    oled.print((unsigned)(durezaManual / 100));
+    oled.print(".");
+    uint32_t dec = durezaManual % 100;
+    if (dec < 10) oled.print("0");
+    oled.print((unsigned)dec);
+    oled.print("%");
+  } else {
+    oled.print("ADC: ");
+    oled.print((unsigned)adcProm);
+  }
+
+  oled.setCursor(0, 39);
+  oled.print(posicionBiomecanica(anguloAct));
+
+  oled.setCursor(0, 52);
+  oled.print("# MENU");
+  oled.display();
+}
+
 void pantallaModoB_Ingreso() {
   oled.clearDisplay();
   oled.setTextSize(1);
@@ -264,7 +377,6 @@ void pantallaModoB_Ingreso() {
 
   oled.setTextSize(2);
   oled.print("\xF8");
-
   oled.display();
 }
 
@@ -303,7 +415,6 @@ void pantallaModoB_Resultado(bool moviendo) {
   oled.print("DUREZA: ");
   oled.print((unsigned)(durezaX100 / 100));
   oled.print(".");
-
   uint32_t dec = durezaX100 % 100;
   if (dec < 10) oled.print("0");
   oled.print((unsigned)dec);
@@ -311,11 +422,9 @@ void pantallaModoB_Resultado(bool moviendo) {
 
   oled.setCursor(0, 42);
   oled.print("DURACION: ");
-
   uint32_t ms = durUs / 1000UL;
   oled.print((unsigned)(ms / 1000));
   oled.print(".");
-
   uint32_t cs = (ms % 1000) / 10;
   if (cs < 10) oled.print("0");
   oled.print((unsigned)cs);
@@ -330,15 +439,23 @@ void resetLogin() {
   posCursor = 0;
 
   timerStop(timerGral);
+  timerStop(timerMov);
   timerStop(timerBtn2);
+
   flagTimerGral = false;
+  flagTimerMov = false;
   flagTimerBtn2 = false;
+
   btn2Activo = false;
+  btn1ActivoA = false;
+  btn1LargoA = false;
+
+  digitalWrite(LED_PIN, LOW);
+  setRGB(0, 0, 255);
 
   estadoAnterior = EST_MODO_B_ERROR;
   estadoActual = EST_LOGIN;
 
-  setRGB(0, 0, 255);
   pantallaLogin();
 }
 
@@ -360,11 +477,16 @@ void setup() {
   pixel.setBrightness(80);
   pixel.show();
 
-  initServo();
-  anguloAct = 0;
-
   pinMode(BTN1_PIN, INPUT_PULLUP);
   pinMode(BTN2_PIN, INPUT_PULLUP);
+  pinMode(SW1_PIN, INPUT_PULLUP);
+  pinMode(SW2_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(POT_PIN, INPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  initServo();
+  anguloAct = 0;
 
   timerGral = timerBegin(1000000);
   timerMov  = timerBegin(1000000);
@@ -386,13 +508,17 @@ void loop() {
   char key = keypad.getKey();
 
   bool btn1Now = digitalRead(BTN1_PIN);
-  bool btn1Press = (btn1Ant == HIGH && btn1Now == LOW);
-  btn1Ant = btn1Now;
+  bool btn1Press = false;
+
+  if (estadoActual != EST_MODO_A) {
+    btn1Press = (btn1Ant == HIGH && btn1Now == LOW);
+    btn1Ant = btn1Now;
+  }
 
   bool btn2Now = digitalRead(BTN2_PIN);
 
-  // ── INPUT CAPTURE BTN2 CON TIMER ───────────────────────────────────────
   bool dentroSistema = (estadoActual == EST_MENU ||
+                        estadoActual == EST_MODO_A ||
                         estadoActual == EST_MODO_B_INGRESO ||
                         estadoActual == EST_MODO_B_MOVIENDO ||
                         estadoActual == EST_MODO_B_LISTO ||
@@ -434,7 +560,6 @@ void loop() {
 
   btn2Ant = btn2Now;
 
-  // ════════════════════════════════════════════════════════════════════════
   switch (estadoActual) {
 
     case EST_LOGIN:
@@ -514,9 +639,7 @@ void loop() {
       break;
 
     case EST_ERROR_PASS:
-      if (tomarBandera(flagTimerGral)) {
-        resetLogin();
-      }
+      if (tomarBandera(flagTimerGral)) resetLogin();
       break;
 
     case EST_BLOQUEADO:
@@ -529,7 +652,6 @@ void loop() {
     case EST_BIENVENIDA:
       if (tomarBandera(flagTimerGral)) {
         timerStop(timerGral);
-
         setRGB(0, 255, 0);
         pantallaMenu();
 
@@ -551,7 +673,30 @@ void loop() {
         flagTimerGral = false;
         iniciarTimerUnaVez(timerGral, US_15S);
 
-        if (key == 'B') {
+        if (key == 'A') {
+          timerStop(timerGral);
+          flagTimerGral = false;
+
+          subModoA = MODO_A_POT;
+          adcProm = leerAdcPromedio12();
+          anguloAct = adcAangulo(adcProm);
+          moverServo(anguloAct);
+
+          ticksAdc = 0;
+          ticksBlink = 0;
+          ledBlinkOn = false;
+          btn1ActivoA = false;
+          btn1LargoA = false;
+
+          pantallaModoA();
+
+          flagTimerMov = false;
+          iniciarTimerPeriodico(timerMov, US_50MS);
+
+          estadoAnterior = EST_MENU;
+          estadoActual = EST_MODO_A;
+
+        } else if (key == 'B') {
           timerStop(timerGral);
           flagTimerGral = false;
 
@@ -576,6 +721,99 @@ void loop() {
         resetLogin();
       }
       break;
+
+    case EST_MODO_A: {
+      if (estadoActual != estadoAnterior) {
+        estadoAnterior = estadoActual;
+        pantallaModoA();
+      }
+
+      bool sw2Activo = (digitalRead(SW2_PIN) == LOW);
+
+      if (sw2Activo && subModoA == MODO_A_POT) {
+        subModoA = MODO_A_BTN;
+        moverServo(0);
+        anguloAct = 0;
+        durUs = 0;
+        btn1ActivoA = false;
+        btn1LargoA = false;
+        timerStop(timerBtn2);
+        flagTimerBtn2 = false;
+        pantallaModoA();
+      }
+
+      if (tomarBandera(flagTimerMov)) {
+        if (subModoA == MODO_A_POT) {
+          ticksAdc++;
+
+          if (ticksAdc >= 12) {
+            ticksAdc = 0;
+            adcProm = leerAdcPromedio12();
+            anguloAct = adcAangulo(adcProm);
+            moverServo(anguloAct);
+            pantallaModoA();
+          }
+
+        } else {
+          bool btn1NowA = digitalRead(BTN1_PIN);
+
+          if (btn1Ant == HIGH && btn1NowA == LOW) {
+            timerStop(timerBtn2);
+            timerWrite(timerBtn2, 0);
+            timerStart(timerBtn2);
+            btn1ActivoA = true;
+            btn1LargoA = false;
+          }
+
+          if (btn1ActivoA && !btn1LargoA && timerRead(timerBtn2) >= US_4S) {
+            btn1LargoA = true;
+            anguloAct = 180;
+            durUs = US_4S;
+            moverServo(anguloAct);
+            pantallaModoA();
+          }
+
+          if (btn1Ant == LOW && btn1NowA == HIGH && btn1ActivoA) {
+            timerStop(timerBtn2);
+
+            uint64_t durBtn = timerRead(timerBtn2);
+            if (durBtn > US_4S) durBtn = US_4S;
+
+            durUs = (uint32_t)durBtn;
+            anguloAct = duracionAangulo(durBtn);
+            moverServo(anguloAct);
+
+            btn1ActivoA = false;
+            btn1LargoA = false;
+
+            pantallaModoA();
+          }
+
+          btn1Ant = btn1NowA;
+        }
+
+        actualizarParpadeoModoA();
+      }
+
+      if (key == '#') {
+        timerStop(timerMov);
+        timerStop(timerBtn2);
+        flagTimerMov = false;
+        flagTimerBtn2 = false;
+
+        digitalWrite(LED_PIN, LOW);
+        setRGB(0, 255, 0);
+
+        pantallaMenu();
+
+        flagTimerGral = false;
+        iniciarTimerUnaVez(timerGral, US_15S);
+
+        estadoAnterior = EST_MODO_A;
+        estadoActual = EST_MENU;
+      }
+      break;
+    }
 
     case EST_MODO_B_INGRESO:
       if (estadoActual != estadoAnterior) {
@@ -642,7 +880,6 @@ void loop() {
             estadoAnterior = EST_MODO_B_INGRESO;
             estadoActual = EST_MODO_B_MOVIENDO;
           }
-
         }
       }
       break;
@@ -695,7 +932,6 @@ void loop() {
         estadoActual = EST_MENU;
       }
       break;
-
 
     case EST_MODO_B_LISTO:
       if (estadoActual != estadoAnterior) {
