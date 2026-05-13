@@ -128,6 +128,7 @@ hw_timer_t *timerBtn2 = NULL;
 #define US_5S     5000000ULL
 #define US_15S   15000000ULL
 #define US_50MS     50000ULL
+#define US_1S     1000000ULL
 
 volatile bool flagTimerGral = false;
 volatile bool flagTimerMov  = false;
@@ -222,6 +223,8 @@ bool btn2Activo = false;
 bool btn1ActivoA = false;
 bool btn1LargoA = false;
 
+bool modoBNavReady = false;
+
 // ─── FUNCIONES MODO A ────────────────────────────────────────────────────
 uint16_t leerAdcPromedio12() {
   uint32_t suma = 0;
@@ -288,12 +291,12 @@ void actualizarParpadeoModoA() {
 // ─── PANTALLAS ───────────────────────────────────────────────────────────
 void pantallaLogin() {
   oled.clearDisplay();
-  oled.setTextSize(1);
+  oled.setTextSize(2);
   oled.setCursor(0, 0);
-  oled.println("INGRESE CLAVE:");
+  oled.print("BIENVENIDO");
 
   oled.setTextSize(2);
-  oled.setCursor(20, 30);
+  oled.setCursor(16, 36);
   for (int i = 0; i < 4; i++) oled.print(passIngresada[i]);
 
   oled.display();
@@ -740,6 +743,17 @@ void loop() {
         timerStop(timerBtn2);
         flagTimerBtn2 = false;
         pantallaModoA();
+      } else if (!sw2Activo && subModoA == MODO_A_BTN) {
+        subModoA = MODO_A_POT;
+        btn1ActivoA = false;
+        btn1LargoA = false;
+        timerStop(timerBtn2);
+        flagTimerBtn2 = false;
+        adcProm = leerAdcPromedio12();
+        anguloAct = adcAangulo(adcProm);
+        moverServo(anguloAct);
+        ticksAdc = 0;
+        pantallaModoA();
       }
 
       if (tomarBandera(flagTimerMov)) {
@@ -871,6 +885,9 @@ void loop() {
 
           if (anguloObj == 0) {
             pantallaModoB_Resultado(false);
+            modoBNavReady = false;
+            flagTimerMov = false;
+            iniciarTimerUnaVez(timerMov, US_1S);
             estadoAnterior = EST_MODO_B_INGRESO;
             estadoActual = EST_MODO_B_LISTO;
           } else {
@@ -903,6 +920,9 @@ void loop() {
           durUs = anguloObj * US_50MS;
           pantallaModoB_Resultado(false);
 
+          modoBNavReady = false;
+          iniciarTimerUnaVez(timerMov, US_1S);
+
           estadoAnterior = EST_MODO_B_MOVIENDO;
           estadoActual = EST_MODO_B_LISTO;
         }
@@ -912,6 +932,8 @@ void loop() {
         timerStop(timerMov);
         flagTimerMov = false;
 
+        moverServo(0);
+        anguloAct = 0;
         resetModoB();
         pantallaModoB_Ingreso();
 
@@ -939,22 +961,31 @@ void loop() {
         pantallaModoB_Resultado(false);
       }
 
-      if (key == 'D') {
-        resetModoB();
-        pantallaModoB_Ingreso();
+      if (!modoBNavReady && tomarBandera(flagTimerMov)) {
+        timerStop(timerMov);
+        modoBNavReady = true;
+      }
 
-        estadoAnterior = EST_MODO_B_LISTO;
-        estadoActual = EST_MODO_B_INGRESO;
+      if (modoBNavReady) {
+        if (key == 'D') {
+          moverServo(0);
+          anguloAct = 0;
+          resetModoB();
+          pantallaModoB_Ingreso();
 
-      } else if (key == '#') {
-        resetModoB();
-        pantallaMenu();
+          estadoAnterior = EST_MODO_B_LISTO;
+          estadoActual = EST_MODO_B_INGRESO;
 
-        flagTimerGral = false;
-        iniciarTimerUnaVez(timerGral, US_15S);
+        } else if (key == '#') {
+          resetModoB();
+          pantallaMenu();
 
-        estadoAnterior = EST_MODO_B_LISTO;
-        estadoActual = EST_MENU;
+          flagTimerGral = false;
+          iniciarTimerUnaVez(timerGral, US_15S);
+
+          estadoAnterior = EST_MODO_B_LISTO;
+          estadoActual = EST_MENU;
+        }
       }
       break;
 
@@ -967,6 +998,8 @@ void loop() {
 
       if (key == 'D') {
         setRGB(0, 0, 0);
+        moverServo(0);
+        anguloAct = 0;
         resetModoB();
         pantallaModoB_Ingreso();
 
