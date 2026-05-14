@@ -49,7 +49,7 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define SERVO_PERIODO  20000UL
 
 #define LEDC_RES_BITS      14UL
-#define LEDC_MAX_COMPARE   ((1UL << LEDC_RES_BITS) - 1UL)
+#define LEDC_MAX_COMPARE   16383
 #define CMP_MIN            408UL
 #define CMP_MAX            2008UL
 
